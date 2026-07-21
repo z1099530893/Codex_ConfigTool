@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Local test folders
+tmp_test*/
+
+# Local settings and editor files
+.idea/
+.vscode/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating system files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Codex/runtime local folders
+.agents/
+.codex/
