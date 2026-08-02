@@ -13,7 +13,7 @@ from tkinter import filedialog, ttk
 
 
 APP_NAME = "Codex 配置助手"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
@@ -25,11 +25,14 @@ TEMPLATE_PROVIDER_ID = "newapi"
 TEMPLATE_MODEL = "gpt-5.4"
 TEMPLATE_PROVIDER_NAME = "openai"
 TEMPLATE_BASE_URL = DEFAULT_BASE_URL
-MAX_BACKUPS = 5
+MAX_BACKUP_NAME_LENGTH = 40
+BACKUP_TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
+BACKUP_DIR_PATTERN = re.compile(r"^(?P<timestamp>\d{8}-\d{6})-(?P<name>.+)$")
 SETTINGS_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "CodexConfigTool"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 OFFICIAL_LOGIN_MODE_PATH_KEY = "official_login_mode_path"
 HIDE_ONBOARDING_KEY = "hide_onboarding"
+ONBOARDING_SHOWN_KEY = "onboarding_shown"
 
 
 def resource_path(name: str) -> Path:
@@ -48,7 +51,39 @@ class CodexConfig:
     config_exists: bool = False
 
 
+@dataclass(frozen=True)
+class BackupSignature:
+    auth_exists: bool
+    config_exists: bool
+    provider_id: str | None
+    provider_name: str | None
+    base_url: str | None
+    model: str | None
+    api_key: str | None
+
+
+@dataclass(frozen=True)
+class BackupRecord:
+    path: Path
+    name: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class BackupResult:
+    status: str
+    record: BackupRecord | None = None
+
+
 class ConfigConflictError(OSError):
+    pass
+
+
+class BackupNameError(ValueError):
+    pass
+
+
+class BackupNameConflictError(BackupNameError):
     pass
 
 
@@ -121,6 +156,12 @@ def save_setting_value(key: str, value: object) -> None:
     SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def should_show_onboarding(settings: dict) -> bool:
+    if HIDE_ONBOARDING_KEY in settings:
+        return False
+    return not bool(settings.get(ONBOARDING_SHOWN_KEY, False))
+
+
 def normalized_path_key(path: Path) -> str:
     try:
         return str(path.expanduser().resolve()).lower()
@@ -150,8 +191,9 @@ def unquote_toml_string(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] == '"':
         try:
-            return bytes(value[1:-1], "utf-8").decode("unicode_escape")
-        except UnicodeDecodeError:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, str) else value[1:-1]
+        except json.JSONDecodeError:
             return value[1:-1]
     if len(value) >= 2 and value[0] == value[-1] == "'":
         return value[1:-1]
@@ -441,7 +483,8 @@ def read_codex_config(config_dir: Path) -> CodexConfig:
     if auth_path.exists():
         try:
             auth_data = json.loads(read_text(auth_path))
-            result.api_key = str(auth_data.get("OPENAI_API_KEY", ""))
+            if isinstance(auth_data, dict):
+                result.api_key = str(auth_data.get("OPENAI_API_KEY", ""))
         except json.JSONDecodeError:
             result.api_key = ""
 
@@ -456,56 +499,228 @@ def read_codex_config(config_dir: Path) -> CodexConfig:
     return result
 
 
-def sanitize_backup_name(name: str) -> str:
+def validate_backup_name_format(name: str) -> str:
     name = name.strip()
     if not name:
-        return "backup"
-    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
-    sanitized = re.sub(r"\s+", "_", sanitized).strip("._ ")
-    return sanitized[:40] or "backup"
+        raise BackupNameError("备份名称不能为空。")
+    if len(name) > MAX_BACKUP_NAME_LENGTH:
+        raise BackupNameError(f"备份名称不能超过 {MAX_BACKUP_NAME_LENGTH} 个字符。")
+    if re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+        raise BackupNameError('备份名称不能包含 < > : " / \\ | ? * 等字符。')
+    if name in {".", ".."} or name.endswith("."):
+        raise BackupNameError("备份名称不能是点号，也不能以点号结尾。")
+    return name
 
 
-def backup_sort_key(path: Path) -> float:
-    try:
-        return path.stat().st_mtime
-    except OSError:
-        return 0
+def suggested_backup_name(config_dir: Path) -> str:
+    provider_name = read_codex_config(config_dir).provider.strip() or DEFAULT_PROVIDER
+    suggestion = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", provider_name).strip(". ")
+    return suggestion[:MAX_BACKUP_NAME_LENGTH] or "backup"
 
 
-def list_backups(config_dir: Path) -> list[Path]:
+def backup_record_from_path(path: Path) -> BackupRecord:
+    match = BACKUP_DIR_PATTERN.match(path.name)
+    if match:
+        try:
+            created_at = datetime.strptime(match.group("timestamp"), BACKUP_TIMESTAMP_FORMAT)
+        except ValueError:
+            created_at = datetime.fromtimestamp(path.stat().st_mtime)
+        name = match.group("name")
+    else:
+        created_at = datetime.fromtimestamp(path.stat().st_mtime)
+        name = path.name
+    return BackupRecord(path=path, name=name, created_at=created_at)
+
+
+def list_backup_records(config_dir: Path) -> list[BackupRecord]:
     backup_root = config_dir / "backups"
     if not backup_root.exists():
         return []
-    return sorted(
-        [item for item in backup_root.iterdir() if item.is_dir() and ((item / "auth.json").exists() or (item / "config.toml").exists())],
-        key=backup_sort_key,
-        reverse=True,
+    records = []
+    for item in backup_root.iterdir():
+        if item.is_dir() and ((item / "auth.json").exists() or (item / "config.toml").exists()):
+            records.append(backup_record_from_path(item))
+    return sorted(records, key=lambda item: item.created_at, reverse=True)
+
+
+def list_backups(config_dir: Path) -> list[Path]:
+    return [record.path for record in list_backup_records(config_dir)]
+
+
+def build_backup_signature(config_dir: Path) -> BackupSignature | None:
+    auth_path = config_dir / "auth.json"
+    config_path = config_dir / "config.toml"
+    auth_exists = auth_path.exists()
+    config_exists = config_path.exists()
+    if not auth_exists and not config_exists:
+        return None
+
+    api_key = ""
+    if auth_exists:
+        auth_text = read_text(auth_path)
+        if len(re.findall(r'"OPENAI_API_KEY"\s*:', auth_text)) > 1:
+            return None
+        try:
+            auth_data = json.loads(auth_text)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(auth_data, dict):
+            return None
+        api_key = str(auth_data.get("OPENAI_API_KEY", ""))
+
+    provider_id = None
+    provider_name = None
+    base_url = None
+    model = None
+    if config_exists:
+        lines = read_text(config_path).splitlines(keepends=True)
+        provider_count = count_top_level_key(lines, "model_provider")
+        model_count = count_top_level_key(lines, "model")
+        if provider_count > 1 or model_count > 1:
+            return None
+        provider_id = get_top_level_value(lines, "model_provider") or DEFAULT_PROVIDER
+        model = get_top_level_value(lines, "model") or TEMPLATE_MODEL
+        provider_section = f"model_providers.{provider_id}"
+        section_count = count_sections(lines, provider_section)
+        if section_count > 1:
+            return None
+        if section_count == 0:
+            if provider_id != DEFAULT_PROVIDER:
+                return None
+            provider_name = DEFAULT_PROVIDER
+            base_url = DEFAULT_BASE_URL
+        else:
+            if count_section_key(lines, provider_section, "name") != 1:
+                return None
+            if count_section_key(lines, provider_section, "base_url") != 1:
+                return None
+            provider_name = get_section_value(lines, provider_section, "name")
+            base_url = get_section_value(lines, provider_section, "base_url")
+            if provider_name is None or base_url is None:
+                return None
+
+    return BackupSignature(
+        auth_exists=auth_exists,
+        config_exists=config_exists,
+        provider_id=provider_id,
+        provider_name=provider_name,
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
     )
 
 
-def prune_backups(config_dir: Path) -> None:
-    backups = list_backups(config_dir)
-    for backup in backups[MAX_BACKUPS:]:
-        shutil.rmtree(backup, ignore_errors=True)
+def named_backup_records(config_dir: Path, name: str, exclude_path: Path | None = None) -> list[BackupRecord]:
+    name_key = name.casefold()
+    excluded_key = normalized_path_key(exclude_path) if exclude_path is not None else None
+    return [
+        record
+        for record in list_backup_records(config_dir)
+        if record.name.casefold() == name_key and normalized_path_key(record.path) != excluded_key
+    ]
 
 
-def create_backup(config_dir: Path, name: str = "", prune: bool = True) -> Path:
+def find_reusable_backup(config_dir: Path, name: str, signature: BackupSignature | None = None) -> BackupRecord | None:
+    signature = signature if signature is not None else build_backup_signature(config_dir)
+    if signature is None:
+        return None
+    for record in named_backup_records(config_dir, name):
+        if build_backup_signature(record.path) == signature:
+            return record
+    return None
+
+
+def validate_new_backup_name(config_dir: Path, name: str, signature: BackupSignature | None = None) -> str:
+    name = validate_backup_name_format(name)
+    matching_names = named_backup_records(config_dir, name)
+    if not matching_names:
+        return name
+    signature = signature if signature is not None else build_backup_signature(config_dir)
+    if signature is not None and any(build_backup_signature(record.path) == signature for record in matching_names):
+        return name
+    raise BackupNameConflictError("已存在同名备份，但核心配置不同，请使用新的备份名称。")
+
+
+def create_or_reuse_backup(config_dir: Path, name: str | None) -> BackupResult:
+    has_source = any((config_dir / file_name).exists() for file_name in ("auth.json", "config.toml"))
+    if not has_source:
+        return BackupResult(status="not_needed")
+    if name is None:
+        raise BackupNameError("当前配置必须先命名备份，才能继续操作。")
+
+    signature = build_backup_signature(config_dir)
+    name = validate_new_backup_name(config_dir, name, signature)
+    reusable = find_reusable_backup(config_dir, name, signature)
+    if reusable is not None:
+        return BackupResult(status="reused", record=reusable)
+
     backup_root = config_dir / "backups"
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_name = sanitize_backup_name(name)
-    backup_dir = backup_root / f"{timestamp}-{backup_name}"
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime(BACKUP_TIMESTAMP_FORMAT)
+    backup_dir = backup_root / f"{timestamp}-{name}"
+    if backup_dir.exists():
+        raise BackupNameConflictError("同一秒内已存在同名备份，请稍后重试或使用新的名称。")
+    backup_dir.mkdir(parents=True, exist_ok=False)
     for file_name in ("auth.json", "config.toml"):
         source = config_dir / file_name
         if source.exists():
             shutil.copy2(source, backup_dir / file_name)
-    if prune:
-        prune_backups(config_dir)
-    return backup_dir
+    return BackupResult(status="created", record=backup_record_from_path(backup_dir))
 
 
-def restore_backup(config_dir: Path, backup_dir: Path) -> Path:
-    safety_backup = create_backup(config_dir, "before-restore", prune=False)
+def validate_backup_path(config_dir: Path, backup_dir: Path) -> Path:
+    backup_root = (config_dir / "backups").resolve()
+    resolved = backup_dir.resolve()
+    if resolved.parent != backup_root:
+        raise OSError("备份目录不在当前配置的 backups 目录中。")
+    return resolved
+
+
+def rename_backup(config_dir: Path, backup_dir: Path, new_name: str) -> BackupRecord:
+    backup_dir = validate_backup_path(config_dir, backup_dir)
+    record = backup_record_from_path(backup_dir)
+    new_name = validate_backup_name_format(new_name)
+    if named_backup_records(config_dir, new_name, exclude_path=backup_dir):
+        raise BackupNameConflictError("已存在同名备份，请使用新的备份名称。")
+    if record.name == new_name:
+        return record
+
+    match = BACKUP_DIR_PATTERN.match(backup_dir.name)
+    timestamp = match.group("timestamp") if match else record.created_at.strftime(BACKUP_TIMESTAMP_FORMAT)
+    target = backup_dir.parent / f"{timestamp}-{new_name}"
+    if target.exists() and normalized_path_key(target) != normalized_path_key(backup_dir):
+        raise BackupNameConflictError("目标备份目录已存在，请使用新的备份名称。")
+    backup_dir.rename(target)
+    return backup_record_from_path(target)
+
+
+def delete_backups(config_dir: Path, backup_dirs: list[Path]) -> None:
+    for backup_dir in backup_dirs:
+        resolved = validate_backup_path(config_dir, backup_dir)
+        if resolved.exists():
+            shutil.rmtree(resolved)
+
+
+def drag_selection_items(
+    ordered_items: tuple[str, ...],
+    anchor: str,
+    current: str,
+    base_selection: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    if anchor not in ordered_items or current not in ordered_items:
+        return tuple(item for item in ordered_items if item in base_selection)
+    start = ordered_items.index(anchor)
+    end = ordered_items.index(current)
+    lower, upper = sorted((start, end))
+    selected = set(base_selection)
+    selected.update(ordered_items[lower : upper + 1])
+    return tuple(item for item in ordered_items if item in selected)
+
+
+def restore_backup(config_dir: Path, backup_dir: Path, backup_name: str | None) -> BackupResult:
+    backup_dir = validate_backup_path(config_dir, backup_dir)
+    if not ((backup_dir / "auth.json").exists() or (backup_dir / "config.toml").exists()):
+        raise OSError("选择的备份不包含可恢复的配置文件。")
+    backup_result = create_or_reuse_backup(config_dir, backup_name)
     for file_name in ("auth.json", "config.toml"):
         source = backup_dir / file_name
         target = config_dir / file_name
@@ -515,8 +730,7 @@ def restore_backup(config_dir: Path, backup_dir: Path) -> Path:
         elif target.exists():
             target.unlink()
     save_settings(config_dir)
-    prune_backups(config_dir)
-    return safety_backup
+    return backup_result
 
 
 def normalize_provider(provider: str, base_url: str) -> str:
@@ -661,7 +875,14 @@ def update_existing_config_toml(config_path: Path, display_name: str, base_url: 
     write_text(config_path, "".join(lines))
 
 
-def save_codex_config(config_dir: Path, api_key: str, display_name: str, base_url: str, model: str) -> Path:
+def save_codex_config(
+    config_dir: Path,
+    api_key: str,
+    display_name: str,
+    base_url: str,
+    model: str,
+    backup_name: str | None,
+) -> BackupResult:
     config_dir.mkdir(parents=True, exist_ok=True)
     base_url = base_url.strip() or DEFAULT_BASE_URL
 
@@ -678,16 +899,22 @@ def save_codex_config(config_dir: Path, api_key: str, display_name: str, base_ur
             + "\n\n普通保存不会修改 model_provider 或重命名 Provider 段，以避免影响 Codex 聊天窗口状态。"
         )
 
-    backup_dir = create_backup(config_dir, "before-save")
+    backup_result = create_or_reuse_backup(config_dir, backup_name)
     update_auth_json(auth_path, api_key)
     update_existing_config_toml(config_path, display_name, base_url, model)
     save_settings(config_dir)
-    return backup_dir
+    return backup_result
 
 
-def save_fresh_codex_config(config_dir: Path, api_key: str, provider: str, base_url: str) -> Path:
+def save_fresh_codex_config(
+    config_dir: Path,
+    api_key: str,
+    provider: str,
+    base_url: str,
+    backup_name: str | None,
+) -> BackupResult:
     config_dir.mkdir(parents=True, exist_ok=True)
-    backup_dir = create_backup(config_dir, "before-save")
+    backup_result = create_or_reuse_backup(config_dir, backup_name)
     auth_path = config_dir / "auth.json"
     auth_data = {}
     if api_key.strip():
@@ -697,25 +924,30 @@ def save_fresh_codex_config(config_dir: Path, api_key: str, provider: str, base_
     config_path = config_dir / "config.toml"
     write_text(config_path, build_fresh_config_toml(api_key, provider, base_url))
     save_settings(config_dir)
-    return backup_dir
+    return backup_result
 
 
-def restore_default_config(config_dir: Path) -> Path | None:
+def restore_default_config(config_dir: Path, backup_name: str | None) -> BackupResult:
     config_dir.mkdir(parents=True, exist_ok=True)
-    has_existing_config = any((config_dir / file_name).exists() for file_name in ("auth.json", "config.toml"))
-    backup_dir = create_backup(config_dir, "before-default") if has_existing_config else None
+    backup_result = create_or_reuse_backup(config_dir, backup_name)
     for file_name in ("auth.json", "config.toml"):
         path = config_dir / file_name
         if path.exists():
             path.unlink()
     save_settings(config_dir)
-    return backup_dir
+    return backup_result
 
 
-def create_custom_template_config(config_dir: Path, api_key: str | None, provider_name: str, base_url: str, model: str) -> Path | None:
+def create_custom_template_config(
+    config_dir: Path,
+    api_key: str | None,
+    provider_name: str,
+    base_url: str,
+    model: str,
+    backup_name: str | None,
+) -> BackupResult:
     config_dir.mkdir(parents=True, exist_ok=True)
-    has_existing_config = any((config_dir / file_name).exists() for file_name in ("auth.json", "config.toml"))
-    backup_dir = create_backup(config_dir, "before-template") if has_existing_config else None
+    backup_result = create_or_reuse_backup(config_dir, backup_name)
     auth_path = config_dir / "auth.json"
     if api_key is None:
         if not auth_path.exists():
@@ -724,7 +956,7 @@ def create_custom_template_config(config_dir: Path, api_key: str | None, provide
         update_auth_json(auth_path, api_key)
     write_text(config_dir / "config.toml", build_custom_template_config_toml(provider_name, base_url, model))
     save_settings(config_dir)
-    return backup_dir
+    return backup_result
 
 def scan_common_locations() -> list[Path]:
     found = []
@@ -851,9 +1083,9 @@ class CodexConfigApp(tk.Tk):
         path_frame.pack(fill="x", pady=(0, 14))
         ttk.Label(path_frame, text="Codex 配置目录", style="Panel.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
         path_entry = ttk.Entry(path_frame, textvariable=self.path_var)
-        path_entry.grid(row=1, column=0, sticky="ew", padx=(0, 10))
-        ttk.Button(path_frame, text="浏览...", command=self.choose_path).grid(row=1, column=1, padx=(0, 8))
-        ttk.Button(path_frame, text="扫描", command=self.scan_paths).grid(row=1, column=2)
+        path_entry.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        ttk.Button(path_frame, text="浏览...", command=self.choose_path).grid(row=1, column=1, sticky="nsew", padx=(0, 8))
+        ttk.Button(path_frame, text="扫描", command=self.scan_paths).grid(row=1, column=2, sticky="nsew")
         path_frame.columnconfigure(0, weight=1)
 
         form = ttk.Frame(root, style="Panel.TFrame", padding=18)
@@ -878,10 +1110,10 @@ class CodexConfigApp(tk.Tk):
         actions.pack(fill="x")
         for text, command in (
             ("重新读取", self.reload_current),
-            ("备份配置", self.backup_current),
-            ("恢复备份", self.restore_backup_dialog),
+            ("备份设置", self.show_backup_settings),
             ("打开备份目录", self.open_backup_dir),
             ("恢复默认配置", self.restore_defaults),
+            ("新手引导", lambda: self.show_onboarding_dialog(force=True)),
         ):
             ttk.Button(actions, text=text, command=command, style="Compact.TButton", width=13).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="保存配置", command=self.save_current, style="Compact.TButton", width=13).pack(side="right")
@@ -894,19 +1126,21 @@ class CodexConfigApp(tk.Tk):
         status_frame.bind("<Configure>", lambda event: status.configure(wraplength=max(event.width - 4, 120)))
 
     def center_window(self, window: tk.Toplevel, width: int | None = None, height: int | None = None, parent: tk.Misc | None = None) -> None:
-        parent = parent or self
-        parent.update_idletasks()
+        parent_window = (parent or self).winfo_toplevel()
+        parent_window.update_idletasks()
         window.update_idletasks()
         if width is None:
             width = window.winfo_reqwidth()
         if height is None:
             height = window.winfo_reqheight()
-        parent_x = parent.winfo_rootx()
-        parent_y = parent.winfo_rooty()
-        parent_width = parent.winfo_width()
-        parent_height = parent.winfo_height()
-        x = parent_x + max((parent_width - width) // 2, 0)
-        y = parent_y + max((parent_height - height) // 2, 0)
+        frame_offset_x = window.winfo_rootx() - window.winfo_x()
+        frame_offset_y = window.winfo_rooty() - window.winfo_y()
+        parent_x = parent_window.winfo_rootx()
+        parent_y = parent_window.winfo_rooty()
+        parent_width = parent_window.winfo_width()
+        parent_height = parent_window.winfo_height()
+        x = parent_x + max((parent_width - width) // 2, 0) - frame_offset_x
+        y = parent_y + max((parent_height - height) // 2, 0) - frame_offset_y
         window.geometry(f"{width}x{height}+{x}+{y}")
 
     def focus_for_dialog(self) -> None:
@@ -950,7 +1184,7 @@ class CodexConfigApp(tk.Tk):
 
     def show_onboarding_dialog(self, force: bool = False) -> None:
         settings = load_settings()
-        if not force and settings.get(HIDE_ONBOARDING_KEY, False):
+        if not force and not should_show_onboarding(settings):
             return
 
         dialog = tk.Toplevel(self)
@@ -971,7 +1205,7 @@ class CodexConfigApp(tk.Tk):
 
         steps = (
             ("1", "填写服务商提供的 API Key、Base URL 和 Model。\nProvider 显示名称填写服务商名称。"),
-            ("2", "点击“保存配置”。保存前，软件会自动备份原来的配置。"),
+            ("2", "点击“保存配置”。保存前，请为当前配置命名备份。"),
             ("3", "完全退出并重新打开 Codex，使新配置生效。"),
         )
         for number, message in steps:
@@ -997,40 +1231,18 @@ class CodexConfigApp(tk.Tk):
             container,
             text="如果输入框已经显示内容，直接修改需要的项目即可。",
             style="Hint.TLabel",
-        ).pack(anchor="w", pady=(0, 14))
-
-        hide_var = tk.BooleanVar(value=bool(settings.get(HIDE_ONBOARDING_KEY, False)))
-        ttk.Checkbutton(container, text="下次不再提示", variable=hide_var).pack(anchor="w")
+        ).pack(anchor="w")
 
         def close() -> None:
-            save_setting_value(HIDE_ONBOARDING_KEY, bool(hide_var.get()))
+            save_setting_value(ONBOARDING_SHOWN_KEY, True)
             dialog.destroy()
             self.lift()
             self.focus_force()
 
-        button_row = ttk.Frame(container)
-        button_row.pack(fill="x", pady=(16, 0))
-        tk.Button(
-            button_row,
-            text="开始使用",
-            command=close,
-            bg="#1f7ed0",
-            fg="#ffffff",
-            activebackground="#1768ad",
-            activeforeground="#ffffff",
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 10, "bold"),
-            padx=18,
-            pady=7,
-        ).pack(side="right")
-
         dialog.protocol("WM_DELETE_WINDOW", close)
         dialog.bind("<Return>", lambda _event: close())
         dialog.bind("<Escape>", lambda _event: close())
-        self.center_window(dialog, 520, 390)
+        self.center_window(dialog, 520)
         dialog.focus_force()
 
     def show_custom_dialog(self, message: str, kind: str = "info", parent: tk.Toplevel | None = None) -> bool:
@@ -1156,52 +1368,63 @@ class CodexConfigApp(tk.Tk):
             container,
             text=f"Copyright © 2026 {AUTHOR_NAME}",
             style="Hint.TLabel",
-        ).pack(pady=(0, 10))
-
-        button_row = ttk.Frame(container)
-        button_row.pack(fill="x")
-
-        def open_onboarding() -> None:
-            dialog.destroy()
-            self.after(50, lambda: self.show_onboarding_dialog(force=True))
-
-        ttk.Button(
-            button_row,
-            text="新手引导",
-            command=open_onboarding,
-            style="Compact.TButton",
-            width=10,
-        ).pack(side="left")
-        ttk.Button(
-            button_row,
-            text="关闭",
-            command=dialog.destroy,
-            style="Compact.TButton",
-            width=10,
-        ).pack(side="right")
+        ).pack()
 
         dialog.bind("<Return>", lambda _event: dialog.destroy())
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
-        self.center_window(dialog, 560, 250)
+        self.center_window(dialog, 560)
         dialog.focus_force()
-    def ask_backup_name(self) -> str | None:
-        dialog = tk.Toplevel(self)
-        dialog.title(APP_NAME)
-        dialog.transient(self)
+    def ask_backup_name(
+        self,
+        config_dir: Path,
+        default_name: str,
+        description: str,
+        parent: tk.Toplevel | None = None,
+        rename_path: Path | None = None,
+    ) -> str | None:
+        target = parent or self
+        source_signature = build_backup_signature(config_dir)
+        dialog = tk.Toplevel(target)
+        dialog.title("备份名称")
+        dialog.transient(target)
         dialog.grab_set()
         dialog.resizable(False, False)
 
         container = ttk.Frame(dialog, padding=18)
         container.pack(fill="both", expand=True)
-        ttk.Label(container, text="请输入备份名称：").pack(anchor="w", pady=(0, 8))
-        name_var = tk.StringVar(value="manual")
+        ttk.Label(container, text=description).pack(anchor="w", pady=(0, 8))
+        ttk.Label(container, text="备份名称：", style="Hint.TLabel").pack(anchor="w", pady=(0, 4))
+        name_var = tk.StringVar(value=default_name)
         entry = ttk.Entry(container, textvariable=name_var, width=52)
         entry.pack(fill="x")
+        error_var = tk.StringVar()
+        error_label = tk.Label(
+            container,
+            textvariable=error_var,
+            bg="#f6f7fb",
+            fg="#c2410c",
+            anchor="w",
+            justify="left",
+            wraplength=390,
+            font=("Microsoft YaHei UI", 9),
+        )
+        error_label.pack(fill="x", pady=(6, 0))
 
         result = {"value": None}
 
         def accept() -> None:
-            result["value"] = name_var.get()
+            try:
+                if rename_path is None:
+                    value = validate_new_backup_name(config_dir, name_var.get(), source_signature)
+                else:
+                    value = validate_backup_name_format(name_var.get())
+                    if named_backup_records(config_dir, value, exclude_path=rename_path):
+                        raise BackupNameConflictError("已存在同名备份，请使用新的备份名称。")
+            except BackupNameError as exc:
+                error_var.set(str(exc))
+                entry.focus_set()
+                return
+            result["value"] = value
             dialog.destroy()
 
         button_row = ttk.Frame(container)
@@ -1211,11 +1434,39 @@ class CodexConfigApp(tk.Tk):
 
         dialog.bind("<Return>", lambda _event: accept())
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
-        self.center_window(dialog, 420, 150)
+        if rename_path is None:
+            try:
+                validate_new_backup_name(config_dir, default_name, source_signature)
+            except BackupNameError as exc:
+                error_var.set(str(exc))
+        self.center_window(dialog, 440, 205, parent=target)
         entry.focus_set()
         entry.selection_range(0, "end")
         self.wait_window(dialog)
         return result["value"]
+
+    def choose_backup_name(self, config_dir: Path, parent: tk.Toplevel | None = None) -> tuple[bool, str | None]:
+        if not any((config_dir / file_name).exists() for file_name in ("auth.json", "config.toml")):
+            return True, None
+        provider_name = read_codex_config(config_dir).provider.strip() or DEFAULT_PROVIDER
+        default_name = suggested_backup_name(config_dir)
+        signature = build_backup_signature(config_dir)
+        if find_reusable_backup(config_dir, default_name, signature) is not None:
+            return True, default_name
+        name = self.ask_backup_name(
+            config_dir,
+            default_name,
+            f"当前备份配置：{provider_name}",
+            parent=parent,
+        )
+        return (name is not None), name
+
+    def backup_result_message(self, result: BackupResult) -> str:
+        if result.status == "not_needed" or result.record is None:
+            return "当前没有旧配置，无需备份。"
+        created_at = result.record.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        action = "已创建备份" if result.status == "created" else "已复用备份"
+        return f"{action}：{result.record.name}（{created_at}）"
 
     def _load_initial_path(self) -> None:
         settings = load_settings()
@@ -1287,8 +1538,9 @@ class CodexConfigApp(tk.Tk):
         self.center_window(picker, 560, 300)
 
     def load_path(self, path: Path) -> None:
-        auto_backup = None
+        backup_result = None
         template_created = False
+        template_canceled = False
         first_use = not (path / "auth.json").exists() and not (path / "config.toml").exists()
         state, issues = classify_config_for_editing(path)
         official_login_mode = is_official_login_mode(path)
@@ -1298,18 +1550,23 @@ class CodexConfigApp(tk.Tk):
             official_login_mode = False
 
         if state == "needs_template" and not official_login_mode:
-            try:
-                auto_backup = create_custom_template_config(
-                    path,
-                    None,
-                    TEMPLATE_PROVIDER_NAME,
-                    TEMPLATE_BASE_URL,
-                    TEMPLATE_MODEL,
-                )
-                template_created = True
-                set_official_login_mode(path, False)
-            except OSError as exc:
-                self.show_error(f"自动创建模板失败：\n{exc}")
+            confirmed, backup_name = self.choose_backup_name(path)
+            if not confirmed:
+                template_canceled = True
+            else:
+                try:
+                    backup_result = create_custom_template_config(
+                        path,
+                        None,
+                        TEMPLATE_PROVIDER_NAME,
+                        TEMPLATE_BASE_URL,
+                        TEMPLATE_MODEL,
+                        backup_name,
+                    )
+                    template_created = True
+                    set_official_login_mode(path, False)
+                except (OSError, BackupNameError) as exc:
+                    self.show_error(f"自动创建模板失败：\n{exc}")
         elif state == "conflict" and not official_login_mode:
             self.show_error(
                 "检测到复杂或冲突配置，软件不会自动覆盖。\n\n"
@@ -1322,11 +1579,19 @@ class CodexConfigApp(tk.Tk):
         self.base_url_var.set(config.base_url or DEFAULT_BASE_URL)
         self.model_var.set(config.model or TEMPLATE_MODEL)
         save_settings(path)
+        if template_canceled:
+            self.status_var.set("已取消自动创建模板，原配置未修改。")
+            return
         if template_created:
+            backup_message = self.backup_result_message(backup_result)
             if first_use:
                 self.status_var.set(f"检测到首次使用，已创建可编辑配置：{path}")
             else:
-                self.status_var.set(f"已自动创建可编辑模板；原配置已自动备份到：{auto_backup}")
+                self.status_var.set(f"已自动创建可编辑模板；{backup_message}；当前已使用配置：{config.provider}")
+                self.show_info(
+                    f"已自动创建可编辑模板。\n\n{backup_message}\n"
+                    f"当前已使用配置：{config.provider}"
+                )
             return
         if official_login_mode:
             if config.config_exists:
@@ -1379,46 +1644,56 @@ class CodexConfigApp(tk.Tk):
             )
             return
 
+        confirmed, backup_name = self.choose_backup_name(path)
+        if not confirmed:
+            self.status_var.set("已取消保存，当前配置未修改。")
+            return
+
         if state == "needs_template":
             try:
-                backup_dir = create_custom_template_config(
+                backup_result = create_custom_template_config(
                     path,
                     self.api_key_var.get(),
                     self.provider_var.get().strip(),
                     self.base_url_var.get(),
                     self.model_var.get(),
+                    backup_name,
                 )
-            except OSError as exc:
+            except (OSError, BackupNameError) as exc:
                 self.show_error(f"保存失败：\n{exc}")
                 return
             set_official_login_mode(path, False)
-            if backup_dir is None:
-                self.status_var.set("保存成功，已自动创建可编辑 API 配置；当前没有旧配置，无需备份。")
-                backup_message = "当前没有旧配置，无需备份。"
-            else:
-                self.status_var.set(f"保存成功，已自动创建可编辑 API 配置；原配置已备份到：{backup_dir}")
-                backup_message = f"原配置已自动备份：{backup_dir.name}"
+            backup_message = self.backup_result_message(backup_result)
+            active_provider = self.provider_var.get().strip()
+            self.status_var.set(
+                f"保存成功，已自动创建可编辑 API 配置；{backup_message}；当前已使用配置：{active_provider}"
+            )
             self.show_info(
                 f"配置保存成功，已自动创建可编辑 API 配置。\n\n{backup_message}\n"
+                f"当前已使用配置：{active_provider}\n"
                 "重新打开 Codex 后通常会读取新配置。"
             )
             return
 
         try:
-            backup_dir = save_codex_config(
+            backup_result = save_codex_config(
                 path,
                 self.api_key_var.get(),
                 self.provider_var.get().strip(),
                 self.base_url_var.get(),
                 self.model_var.get(),
+                backup_name,
             )
-        except OSError as exc:
+        except (OSError, BackupNameError) as exc:
             self.show_error(f"保存失败：\n{exc}")
             return
         set_official_login_mode(path, False)
-        self.status_var.set(f"保存成功，原配置已自动备份到：{backup_dir}")
+        backup_message = self.backup_result_message(backup_result)
+        active_provider = self.provider_var.get().strip()
+        self.status_var.set(f"保存成功；{backup_message}；当前已使用配置：{active_provider}")
         self.show_info(
-            f"配置保存成功。\n\n原配置已自动备份：{backup_dir.name}\n"
+            f"配置保存成功。\n\n{backup_message}\n"
+            f"当前已使用配置：{active_provider}\n"
             "重新打开 Codex 后通常会读取新配置。"
         )
 
@@ -1432,9 +1707,13 @@ class CodexConfigApp(tk.Tk):
         )
         if not self.ask_yes_no(message):
             return
+        confirmed, backup_name = self.choose_backup_name(self.current_path())
+        if not confirmed:
+            self.status_var.set("已取消恢复默认配置，当前配置未修改。")
+            return
         try:
-            backup_dir = restore_default_config(self.current_path())
-        except OSError as exc:
+            backup_result = restore_default_config(self.current_path(), backup_name)
+        except (OSError, BackupNameError) as exc:
             self.show_error(f"恢复失败：\n{exc}")
             return
 
@@ -1443,73 +1722,391 @@ class CodexConfigApp(tk.Tk):
         self.provider_var.set(DEFAULT_PROVIDER)
         self.base_url_var.set(DEFAULT_BASE_URL)
         self.model_var.set(TEMPLATE_MODEL)
-        if backup_dir is None:
-            self.status_var.set("已进入官方登录模式；当前没有旧配置，无需备份。")
-            backup_message = "当前没有旧配置，无需备份。"
-        else:
-            self.status_var.set(f"已进入官方登录模式；原配置已自动备份到：{backup_dir}")
-            backup_message = f"原配置已自动备份：{backup_dir.name}"
+        backup_message = self.backup_result_message(backup_result)
+        self.status_var.set(f"已进入官方登录模式；{backup_message}")
         self.show_info(
-            f"已恢复默认配置并进入官方登录模式。\n\n{backup_message}\n"
+            f"已恢复默认配置。\n\n{backup_message}\n"
+            "当前已使用配置：官方登录模式\n"
             "请关闭本工具并启动 Codex，按提示登录自己的 GPT 账号。"
         )
-    def backup_current(self) -> None:
-        name = self.ask_backup_name()
-        if name is None:
-            return
-        try:
-            backup_dir = create_backup(self.current_path(), name)
-        except OSError as exc:
-            self.show_error(f"备份失败：\n{exc}")
-            return
-        self.status_var.set(f"备份成功：{backup_dir}")
-        self.show_info(f"当前配置已备份。\n最多保留 {MAX_BACKUPS} 个备份。")
 
-    def restore_backup_dialog(self) -> None:
-        backups = list_backups(self.current_path())
-        if not backups:
-            self.show_info("当前配置目录还没有可恢复的备份。")
-            return
+    def show_backup_settings(self) -> None:
+        config_dir = self.current_path()
+        dialog = tk.Toplevel(self)
+        dialog.title("备份设置")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.minsize(620, 360)
 
-        picker = tk.Toplevel(self)
-        picker.title("恢复备份")
-        picker.transient(self)
-        picker.grab_set()
-        ttk.Label(picker, text="选择一个备份进行恢复。恢复前会自动备份当前配置。").pack(anchor="w", padx=16, pady=(16, 8))
-        listbox = tk.Listbox(picker, height=6, font=("Consolas", 10))
-        listbox.pack(fill="both", expand=True, padx=16, pady=(0, 12))
-        for backup in backups:
-            listbox.insert("end", backup.name)
-        listbox.selection_set(0)
+        container = ttk.Frame(dialog, padding=16)
+        container.pack(fill="both", expand=True)
+        ttk.Label(
+            container,
+            text="管理已有备份。右击备份可以编辑名称、删除或进入多选模式。",
+            style="Hint.TLabel",
+        ).pack(anchor="w", pady=(0, 10))
 
-        button_row = ttk.Frame(picker)
-        button_row.pack(fill="x", padx=16, pady=(0, 16))
+        tree_frame = ttk.Frame(container)
+        tree_frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(
+            tree_frame,
+            columns=("name", "created_at"),
+            show="headings",
+            selectmode="browse",
+            height=10,
+        )
+        tree.heading("name", text="备份名称")
+        tree.heading("created_at", text="创建时间")
+        tree.column("name", minwidth=260, width=360, anchor="w")
+        tree.column("created_at", minwidth=150, width=170, anchor="center", stretch=False)
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-        def accept() -> None:
-            selection = listbox.curselection()
-            if not selection:
+        empty_var = tk.StringVar()
+        ttk.Label(container, textvariable=empty_var, style="Hint.TLabel").pack(anchor="w", pady=(8, 0))
+
+        button_row = ttk.Frame(container)
+        button_row.pack(fill="x", pady=(14, 0))
+        button_row.columnconfigure(3, weight=1)
+        records_by_item: dict[str, BackupRecord] = {}
+        multi_mode = {"value": False}
+        drag_state = {
+            "active": False,
+            "anchor": None,
+            "base_selection": (),
+            "press_y": 0,
+            "last_y": 0,
+            "moved": False,
+            "scroll_job": None,
+        }
+
+        def selected_records() -> list[BackupRecord]:
+            return [records_by_item[item] for item in tree.selection() if item in records_by_item]
+
+        def update_buttons() -> None:
+            selection_count = len(selected_records())
+            item_count = len(records_by_item)
+            restore_button.configure(state="normal" if selection_count == 1 else "disabled")
+            delete_selected_button.configure(state="normal" if selection_count > 0 else "disabled")
+            select_all_button.configure(
+                text="取消全选" if item_count > 0 and selection_count == item_count else "全选",
+                state="normal" if item_count > 0 else "disabled",
+            )
+
+        def refresh(select_path: Path | None = None) -> None:
+            records_by_item.clear()
+            for item in tree.get_children():
+                tree.delete(item)
+            selected_item = None
+            for index, record in enumerate(list_backup_records(config_dir)):
+                item = f"backup-{index}"
+                records_by_item[item] = record
+                tree.insert(
+                    "",
+                    "end",
+                    iid=item,
+                    values=(record.name, record.created_at.strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                if select_path is not None and normalized_path_key(record.path) == normalized_path_key(select_path):
+                    selected_item = item
+            empty_var.set("暂无可用备份。" if not records_by_item else "备份不会自动删除，将一直保留到你手动删除。")
+            if selected_item is not None:
+                tree.selection_set(selected_item)
+                tree.focus(selected_item)
+            elif records_by_item and not multi_mode["value"]:
+                first_item = next(iter(records_by_item))
+                tree.selection_set(first_item)
+                tree.focus(first_item)
+            update_buttons()
+
+        def set_multi_mode(enabled: bool) -> None:
+            cancel_drag()
+            multi_mode["value"] = enabled
+            tree.configure(selectmode="extended" if enabled else "browse")
+            if enabled:
+                select_all_button.grid()
+                delete_selected_button.grid()
+                exit_multi_button.grid()
+            else:
+                selection = tree.selection()
+                if len(selection) > 1:
+                    tree.selection_set(selection[0])
+                select_all_button.grid_remove()
+                delete_selected_button.grid_remove()
+                exit_multi_button.grid_remove()
+            update_buttons()
+
+        def toggle_select_all() -> None:
+            if not multi_mode["value"]:
                 return
-            backup = backups[selection[0]]
-            if not self.ask_yes_no(f"确定恢复这个备份吗？\n{backup.name}", parent=picker):
+            items = tree.get_children()
+            if items and len(tree.selection()) == len(items):
+                tree.selection_remove(*items)
+            else:
+                tree.selection_set(items)
+                if items:
+                    tree.focus(items[0])
+            update_buttons()
+
+        def on_select_all_shortcut(_event) -> str | None:
+            if not multi_mode["value"]:
+                return None
+            toggle_select_all()
+            return "break"
+
+        def edit_record(record: BackupRecord) -> None:
+            new_name = self.ask_backup_name(
+                config_dir,
+                record.name,
+                f"修改备份名称：{record.name}",
+                parent=dialog,
+                rename_path=record.path,
+            )
+            if new_name is None:
                 return
             try:
-                safety_backup = restore_backup(self.current_path(), backup)
-            except OSError as exc:
-                self.show_error(f"恢复失败：\n{exc}", parent=picker)
+                renamed = rename_backup(config_dir, record.path, new_name)
+            except (OSError, BackupNameError) as exc:
+                self.show_error(f"修改备份名称失败：\n{exc}", parent=dialog)
                 return
-            picker.destroy()
-            restored_state, _issues = classify_config_for_editing(self.current_path())
-            set_official_login_mode(self.current_path(), restored_state == "needs_template")
+            refresh(renamed.path)
+
+        def remove_records(records: list[BackupRecord]) -> None:
+            if not records:
+                return
+            if len(records) == 1:
+                message = f"确定永久删除这个备份吗？\n\n{records[0].name}"
+            else:
+                message = f"确定永久删除所选的 {len(records)} 个备份吗？\n\n删除后无法恢复。"
+            if not self.ask_yes_no(message, parent=dialog):
+                return
+            try:
+                delete_backups(config_dir, [record.path for record in records])
+            except OSError as exc:
+                self.show_error(f"删除备份失败：\n{exc}", parent=dialog)
+                return
+            refresh()
+
+        def restore_selected() -> None:
+            records = selected_records()
+            if len(records) != 1:
+                return
+            selected = records[0]
+            if not self.ask_yes_no(
+                f"确定恢复这个备份吗？\n\n{selected.name}\n{selected.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                parent=dialog,
+            ):
+                return
+            confirmed, backup_name = self.choose_backup_name(config_dir, parent=dialog)
+            if not confirmed:
+                self.status_var.set("已取消恢复备份，当前配置未修改。")
+                return
+            try:
+                backup_result = restore_backup(config_dir, selected.path, backup_name)
+            except (OSError, BackupNameError) as exc:
+                self.show_error(f"恢复失败：\n{exc}", parent=dialog)
+                return
+
+            restored_state, _issues = classify_config_for_editing(config_dir)
+            official_mode = restored_state == "needs_template"
+            set_official_login_mode(config_dir, official_mode)
+            restored_config = read_codex_config(config_dir)
+            active_config = "官方登录模式" if official_mode else restored_config.provider
+            backup_message = self.backup_result_message(backup_result)
+            dialog.destroy()
             self.reload_current()
-            self.status_var.set(f"已恢复备份：{backup.name}；恢复前配置已自动备份到：{safety_backup}")
+            self.status_var.set(f"已恢复备份：{selected.name}；{backup_message}；当前已使用配置：{active_config}")
             self.show_info(
-                f"备份已恢复。\n\n恢复前配置已自动备份：{safety_backup.name}\n"
+                f"备份已恢复：{selected.name}\n\n{backup_message}\n"
+                f"当前已使用配置：{active_config}\n"
                 "重新打开 Codex 后通常会读取恢复后的配置。"
             )
 
-        ttk.Button(button_row, text="取消", command=picker.destroy, style="Compact.TButton", width=9).pack(side="right", padx=(8, 0))
-        ttk.Button(button_row, text="恢复选中备份", command=accept, style="Compact.TButton", width=14).pack(side="right")
-        self.center_window(picker, 520, 280)
+        def cancel_drag() -> None:
+            scroll_job = drag_state["scroll_job"]
+            if scroll_job is not None:
+                try:
+                    tree.after_cancel(scroll_job)
+                except tk.TclError:
+                    pass
+            drag_state.update(
+                {
+                    "active": False,
+                    "anchor": None,
+                    "base_selection": (),
+                    "moved": False,
+                    "scroll_job": None,
+                }
+            )
+
+        def apply_drag_selection(current_item: str) -> None:
+            anchor = drag_state["anchor"]
+            if anchor is None:
+                return
+            selection = drag_selection_items(
+                tree.get_children(),
+                anchor,
+                current_item,
+                drag_state["base_selection"],
+            )
+            tree.selection_set(selection)
+            tree.focus(current_item)
+            tree.see(current_item)
+            update_buttons()
+
+        def auto_scroll_drag() -> None:
+            drag_state["scroll_job"] = None
+            if not drag_state["active"] or not drag_state["moved"] or not tree.winfo_exists():
+                return
+            height = tree.winfo_height()
+            y = drag_state["last_y"]
+            direction = -1 if y < 28 else 1 if y > height - 24 else 0
+            if direction == 0:
+                return
+            tree.yview_scroll(direction, "units")
+            target_y = max(24, min(y, height - 2))
+            current_item = tree.identify_row(target_y)
+            if current_item:
+                apply_drag_selection(current_item)
+            drag_state["scroll_job"] = tree.after(90, auto_scroll_drag)
+
+        def schedule_drag_scroll() -> None:
+            height = tree.winfo_height()
+            y = drag_state["last_y"]
+            near_edge = y < 28 or y > height - 24
+            if near_edge and drag_state["scroll_job"] is None:
+                drag_state["scroll_job"] = tree.after(90, auto_scroll_drag)
+            elif not near_edge and drag_state["scroll_job"] is not None:
+                try:
+                    tree.after_cancel(drag_state["scroll_job"])
+                except tk.TclError:
+                    pass
+                drag_state["scroll_job"] = None
+
+        def on_tree_press(event) -> str | None:
+            if not multi_mode["value"]:
+                return None
+            item = tree.identify_row(event.y)
+            if not item:
+                return "break"
+            drag_state.update(
+                {
+                    "active": True,
+                    "anchor": item,
+                    "base_selection": tree.selection(),
+                    "press_y": event.y,
+                    "last_y": event.y,
+                    "moved": False,
+                }
+            )
+            return "break"
+
+        def on_tree_motion(event) -> str | None:
+            if not multi_mode["value"] or not drag_state["active"]:
+                return None
+            drag_state["last_y"] = event.y
+            current_item = tree.identify_row(event.y)
+            if abs(event.y - drag_state["press_y"]) >= 4 or current_item != drag_state["anchor"]:
+                drag_state["moved"] = True
+            if drag_state["moved"] and current_item:
+                apply_drag_selection(current_item)
+            schedule_drag_scroll()
+            return "break"
+
+        def on_tree_release(_event) -> str | None:
+            if not multi_mode["value"] or not drag_state["active"]:
+                return None
+            anchor = drag_state["anchor"]
+            base_selection = drag_state["base_selection"]
+            moved = drag_state["moved"]
+            cancel_drag()
+            if not moved and anchor is not None:
+                if anchor in base_selection:
+                    tree.selection_remove(anchor)
+                else:
+                    tree.selection_add(anchor)
+                    tree.focus(anchor)
+            update_buttons()
+            return "break"
+
+        def show_context_menu(event) -> None:
+            item = tree.identify_row(event.y)
+            if not item or item not in records_by_item:
+                return
+            if multi_mode["value"]:
+                if item not in tree.selection():
+                    tree.selection_add(item)
+            else:
+                tree.selection_set(item)
+            tree.focus(item)
+            update_buttons()
+            record = records_by_item[item]
+            menu = tk.Menu(dialog, tearoff=False)
+            menu.add_command(label="编辑", command=lambda: edit_record(record))
+            menu.add_command(label="删除", command=lambda: remove_records([record]))
+            menu.add_separator()
+            menu.add_command(
+                label="退出多选" if multi_mode["value"] else "多选",
+                command=lambda: set_multi_mode(not multi_mode["value"]),
+            )
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        select_all_button = ttk.Button(
+            button_row,
+            text="全选",
+            command=toggle_select_all,
+            style="Compact.TButton",
+            width=10,
+        )
+        select_all_button.grid(row=0, column=0, padx=(0, 8))
+        delete_selected_button = ttk.Button(
+            button_row,
+            text="删除所选备份",
+            command=lambda: remove_records(selected_records()),
+            style="Compact.TButton",
+            width=14,
+        )
+        delete_selected_button.grid(row=0, column=1, padx=(0, 8))
+        exit_multi_button = ttk.Button(
+            button_row,
+            text="退出多选",
+            command=lambda: set_multi_mode(False),
+            style="Compact.TButton",
+            width=10,
+        )
+        exit_multi_button.grid(row=0, column=2)
+        restore_button = ttk.Button(
+            button_row,
+            text="恢复选中备份",
+            command=restore_selected,
+            style="Compact.TButton",
+            width=14,
+        )
+        restore_button.grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(
+            button_row,
+            text="关闭",
+            command=dialog.destroy,
+            style="Compact.TButton",
+            width=9,
+        ).grid(row=0, column=5)
+
+        tree.bind("<<TreeviewSelect>>", lambda _event: update_buttons())
+        tree.bind("<ButtonPress-1>", on_tree_press, add="+")
+        tree.bind("<B1-Motion>", on_tree_motion, add="+")
+        tree.bind("<ButtonRelease-1>", on_tree_release, add="+")
+        tree.bind("<Button-3>", show_context_menu)
+        dialog.bind("<Control-a>", on_select_all_shortcut)
+        dialog.bind("<Escape>", lambda _event: set_multi_mode(False) if multi_mode["value"] else dialog.destroy())
+        set_multi_mode(False)
+        refresh()
+        self.center_window(dialog, 660, 410)
+        tree.focus_set()
 
     def open_backup_dir(self) -> None:
         backup_dir = self.current_path() / "backups"
