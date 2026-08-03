@@ -15,9 +15,11 @@ if not exist "codex_config_tool.py" (
     goto :failed
 )
 
-if not exist "赞赏.png" (
-    echo [ERROR] 赞赏.png was not found.
-    goto :failed
+for %%F in ("赞赏.png" "app_icon.png" "app_icon_title.png" "app_icon_about.png" "eye_smooth.png" "eye_off_smooth.png" "app_icon.ico") do (
+    if not exist "%%~F" (
+        echo [ERROR] %%~F was not found.
+        goto :failed
+    )
 )
 
 where python >nul 2>nul
@@ -47,7 +49,7 @@ if not errorlevel 1 (
 
 echo [INFO] Building CodexConfigTool.exe...
 echo.
-python -m PyInstaller --noconfirm --clean --onefile --windowed --add-data "赞赏.png;." --name "CodexConfigTool" "codex_config_tool.py"
+python -m PyInstaller --noconfirm --clean --onefile --windowed --icon "app_icon.ico" --add-data "赞赏.png;." --add-data "app_icon.png;." --add-data "app_icon_title.png;." --add-data "app_icon_about.png;." --add-data "eye_smooth.png;." --add-data "eye_off_smooth.png;." --add-data "app_icon.ico;." --name "CodexConfigTool" "codex_config_tool.py"
 if errorlevel 1 goto :failed
 
 echo.

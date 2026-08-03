@@ -9,6 +9,7 @@ dist/
 
 # Local test folders
 tmp_test*/
+_snapshots/
 
 # Local settings and editor files
 .idea/

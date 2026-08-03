@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,19 @@ class BackupManagementTests(unittest.TestCase):
         self.settings_file_patch.stop()
         self.settings_dir_patch.stop()
         self.temp_dir.cleanup()
+
+    @unittest.skipUnless(os.name == "nt", "Windows named mutex test")
+    def test_single_instance_mutex_rejects_duplicate_and_releases(self) -> None:
+        name = f"Local\\CodexConfigTool-Test-{os.getpid()}-{id(self)}"
+        first = app.acquire_single_instance(name)
+        self.assertIsNotNone(first)
+        try:
+            self.assertIsNone(app.acquire_single_instance(name))
+        finally:
+            app.release_single_instance(first)
+        second = app.acquire_single_instance(name)
+        self.assertIsNotNone(second)
+        app.release_single_instance(second)
 
     def write_config(
         self,
@@ -50,43 +64,80 @@ class BackupManagementTests(unittest.TestCase):
             config_text += f"\n{extra_config.strip()}\n"
         (config_dir / "config.toml").write_text(config_text, encoding="utf-8")
 
-    def test_switching_between_a_and_b_reuses_existing_named_backups(self) -> None:
+    def create_profile(self, name: str, provider: str, **kwargs) -> app.BackupRecord:
+        self.write_config(self.config_dir, provider, **kwargs)
+        return app.create_named_backup(self.config_dir, name)
+
+    def test_new_config_is_named_saved_and_applied(self) -> None:
         self.write_config(self.config_dir, "A", "https://a.example.com/v1")
 
-        first = app.save_codex_config(
+        result = app.save_config_profile(
             self.config_dir,
-            "test-key",
+            "key-b",
             "B",
             "https://b.example.com/v1",
-            "gpt-5.4",
-            "A",
+            "gpt-5.5",
+            "editable",
+            "Provider B",
         )
-        second = app.save_codex_config(
+
+        self.assertEqual("created", result.status)
+        self.assertEqual("Provider B", result.record.name)
+        self.assertEqual("B", app.read_codex_config(self.config_dir).provider)
+        self.assertEqual(
+            app.build_backup_signature(self.config_dir),
+            app.build_backup_signature(result.record.path),
+        )
+
+    def test_existing_config_is_applied_without_a_name(self) -> None:
+        profile_a = self.create_profile("Provider A", "A", base_url="https://a.example.com/v1")
+        self.create_profile("Provider B", "B", base_url="https://b.example.com/v1")
+
+        result = app.save_config_profile(
             self.config_dir,
             "test-key",
             "A",
             "https://a.example.com/v1",
             "gpt-5.4",
-            "B",
-        )
-        third = app.save_codex_config(
-            self.config_dir,
-            "test-key",
-            "B",
-            "https://b.example.com/v1",
-            "gpt-5.4",
-            "A",
+            "editable",
+            None,
         )
 
-        self.assertEqual("created", first.status)
-        self.assertEqual("created", second.status)
-        self.assertEqual("reused", third.status)
-        self.assertEqual({"A", "B"}, {record.name for record in app.list_backup_records(self.config_dir)})
+        self.assertEqual("existing", result.status)
+        self.assertEqual(profile_a.path, result.record.path)
+        self.assertEqual("A", app.read_codex_config(self.config_dir).provider)
         self.assertEqual(2, len(app.list_backup_records(self.config_dir)))
 
-    def test_deduplication_ignores_codex_managed_state(self) -> None:
-        self.write_config(self.config_dir, "A")
-        created = app.create_or_reuse_backup(self.config_dir, "A")
+    def test_direct_switch_never_saves_outgoing_configuration(self) -> None:
+        profile_a = self.create_profile("Provider A", "A")
+        self.create_profile("Provider B", "B")
+        self.write_config(self.config_dir, "Unsaved C")
+
+        app.restore_backup(self.config_dir, profile_a.path)
+
+        self.assertEqual("A", app.read_codex_config(self.config_dir).provider)
+        self.assertEqual({"Provider A", "Provider B"}, {item.name for item in app.list_backup_records(self.config_dir)})
+
+    def test_switch_does_not_update_profile_time_or_content(self) -> None:
+        profile_a = self.create_profile("Provider A", "A")
+        original_mtime = profile_a.path.stat().st_mtime_ns
+        original_auth = (profile_a.path / "auth.json").read_bytes()
+        original_config = (profile_a.path / "config.toml").read_bytes()
+        self.write_config(self.config_dir, "B")
+
+        app.restore_backup(self.config_dir, profile_a.path)
+
+        self.assertEqual(original_mtime, profile_a.path.stat().st_mtime_ns)
+        self.assertEqual(original_auth, (profile_a.path / "auth.json").read_bytes())
+        self.assertEqual(original_config, (profile_a.path / "config.toml").read_bytes())
+
+    def test_matching_ignores_codex_managed_state_and_profile_name(self) -> None:
+        profile = self.create_profile(
+            "Any profile name",
+            "A",
+            extra_config='[desktop]\nwindow_state = "first"',
+            extra_auth={"tokens": {"access_token": "first"}},
+        )
         self.write_config(
             self.config_dir,
             "A",
@@ -94,144 +145,263 @@ class BackupManagementTests(unittest.TestCase):
             extra_auth={"tokens": {"access_token": "changed"}},
         )
 
-        reused = app.create_or_reuse_backup(self.config_dir, "A")
+        result = app.save_config_profile(
+            self.config_dir,
+            "test-key",
+            "A",
+            "https://a.example.com/v1",
+            "gpt-5.4",
+            "editable",
+            None,
+        )
 
-        self.assertEqual("created", created.status)
-        self.assertEqual("reused", reused.status)
-        self.assertEqual(created.record.path, reused.record.path)
+        self.assertEqual("existing", result.status)
+        self.assertEqual(profile.path, result.record.path)
+        self.assertIn('window_state = "changed"', (self.config_dir / "config.toml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            {"access_token": "changed"},
+            json.loads((self.config_dir / "auth.json").read_text(encoding="utf-8"))["tokens"],
+        )
 
-    def test_same_name_with_different_core_config_is_rejected(self) -> None:
-        self.write_config(self.config_dir, "A", model="gpt-5.4")
-        app.create_or_reuse_backup(self.config_dir, "A")
-        self.write_config(self.config_dir, "A", model="gpt-5.5")
-
-        with self.assertRaises(app.BackupNameConflictError):
-            app.create_or_reuse_backup(self.config_dir, "A")
-
-    def test_unreadable_core_config_is_never_reused_automatically(self) -> None:
+    def test_new_config_requires_name_and_cancellation_changes_nothing(self) -> None:
         self.write_config(self.config_dir, "A")
-        (self.config_dir / "auth.json").write_text("{invalid", encoding="utf-8")
-        first = app.create_or_reuse_backup(self.config_dir, "A")
+        before = app.capture_config_files(self.config_dir)
 
-        with self.assertRaises(app.BackupNameConflictError):
-            app.create_or_reuse_backup(self.config_dir, "A")
+        with self.assertRaises(app.BackupNameError):
+            app.save_config_profile(
+                self.config_dir,
+                "new-key",
+                "B",
+                "https://b.example.com/v1",
+                "gpt-5.5",
+                "editable",
+                None,
+            )
 
-        self.assertEqual("created", first.status)
-
-    def test_no_existing_config_skips_backup(self) -> None:
-        result = app.create_or_reuse_backup(self.config_dir, None)
-
-        self.assertEqual("not_needed", result.status)
-        self.assertIsNone(result.record)
+        self.assertEqual(before, app.capture_config_files(self.config_dir))
         self.assertFalse((self.config_dir / "backups").exists())
 
-    def test_backups_are_never_pruned(self) -> None:
+    def test_duplicate_profile_name_is_rejected_before_modifying_config(self) -> None:
+        self.create_profile("Shared", "A")
+        before = app.capture_config_files(self.config_dir)
+
+        with self.assertRaises(app.BackupNameConflictError):
+            app.save_config_profile(
+                self.config_dir,
+                "new-key",
+                "B",
+                "https://b.example.com/v1",
+                "gpt-5.5",
+                "editable",
+                "shared",
+            )
+
+        self.assertEqual(before, app.capture_config_files(self.config_dir))
+
+    def test_failed_profile_creation_rolls_back_current_config(self) -> None:
         self.write_config(self.config_dir, "A")
+        before = app.capture_config_files(self.config_dir)
+
+        with patch.object(app, "create_named_backup", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                app.save_config_profile(
+                    self.config_dir,
+                    "new-key",
+                    "B",
+                    "https://b.example.com/v1",
+                    "gpt-5.5",
+                    "editable",
+                    "Provider B",
+                )
+
+        self.assertEqual(before, app.capture_config_files(self.config_dir))
+
+    def test_template_state_can_be_saved_as_new_profile(self) -> None:
+        result = app.save_config_profile(
+            self.config_dir,
+            "template-key",
+            "Template Provider",
+            "https://template.example.com/v1",
+            "gpt-5.5",
+            "needs_template",
+            "Template",
+        )
+
+        self.assertEqual("created", result.status)
+        self.assertEqual("Template Provider", app.read_codex_config(self.config_dir).provider)
+        self.assertEqual("editable", app.classify_config_for_editing(self.config_dir)[0])
+
+    def test_create_profile_without_apply_keeps_current_config(self) -> None:
+        self.write_config(self.config_dir, "Current")
+        before = app.capture_config_files(self.config_dir)
+
+        created = app.create_config_profile(
+            self.config_dir,
+            "Saved only",
+            "saved-key",
+            "Saved Provider",
+            "https://saved.example.com/v1",
+            "gpt-5.6-sol",
+        )
+
+        self.assertEqual(before, app.capture_config_files(self.config_dir))
+        self.assertEqual("Saved Provider", app.read_codex_config(created.path).provider)
+
+    def test_create_profile_and_apply_switches_current_config(self) -> None:
+        self.write_config(self.config_dir, "Current")
+
+        created = app.create_config_profile(
+            self.config_dir,
+            "Created and active",
+            "active-key",
+            "Active Provider",
+            "https://active.example.com/v1",
+            "gpt-5.6-sol",
+            apply_to_current=True,
+        )
+
+        self.assertEqual("Active Provider", app.read_codex_config(self.config_dir).provider)
+        self.assertEqual(created.path, app.find_matching_backup(self.config_dir).path)
+
+    def test_edit_inactive_profile_updates_all_fields_without_switching(self) -> None:
+        active = self.create_profile("Active", "Active")
+        inactive = self.create_profile("Inactive", "Inactive")
+        app.restore_backup(self.config_dir, active.path)
+        current_before = app.capture_config_files(self.config_dir)
+
+        edited = app.update_config_profile(
+            self.config_dir,
+            inactive.path,
+            "Renamed inactive",
+            "edited-key",
+            "Edited Provider",
+            "https://edited.example.com/v1",
+            "gpt-5.6-sol",
+        )
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(inactive.created_at, edited.created_at)
+        edited_config = app.read_codex_config(edited.path)
+        self.assertEqual("Edited Provider", edited_config.provider)
+        self.assertEqual("edited-key", edited_config.api_key)
+
+    def test_edit_active_profile_updates_library_and_current_config(self) -> None:
+        active = self.create_profile("Active", "Active")
+        app.restore_backup(self.config_dir, active.path)
+
+        edited = app.update_config_profile(
+            self.config_dir,
+            active.path,
+            "Active renamed",
+            "new-key",
+            "Active edited",
+            "https://active-edited.example.com/v1",
+            "gpt-5.6-sol",
+            apply_to_current=True,
+        )
+
+        self.assertEqual("Active renamed", edited.name)
+        self.assertEqual("Active edited", app.read_codex_config(self.config_dir).provider)
+        self.assertEqual(
+            app.build_backup_signature(edited.path),
+            app.build_backup_signature(self.config_dir),
+        )
+
+    def test_duplicate_profile_content_is_rejected_without_changes(self) -> None:
+        existing = self.create_profile("Existing", "Existing")
+        current_before = app.capture_config_files(self.config_dir)
+
+        with self.assertRaises(app.BackupNameConflictError):
+            app.create_config_profile(
+                self.config_dir,
+                "Duplicate",
+                "test-key",
+                "Existing",
+                "https://existing.example.com/v1",
+                "gpt-5.4",
+            )
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual([existing.path], [record.path for record in app.list_backup_records(self.config_dir)])
+
+    def test_profiles_are_never_pruned(self) -> None:
         for index in range(8):
-            result = app.create_or_reuse_backup(self.config_dir, f"backup-{index}")
-            self.assertEqual("created", result.status)
+            self.write_config(self.config_dir, f"Provider {index}")
+            app.create_named_backup(self.config_dir, f"profile-{index}")
 
         self.assertEqual(8, len(app.list_backup_records(self.config_dir)))
 
     def test_rename_preserves_timestamp_and_content_and_rejects_duplicates(self) -> None:
-        self.write_config(self.config_dir, "A")
-        first = app.create_or_reuse_backup(self.config_dir, "First").record
-        second = app.create_or_reuse_backup(self.config_dir, "Second").record
+        first = self.create_profile("First", "A")
+        second = self.create_profile("Second", "B")
         original_auth = (first.path / "auth.json").read_bytes()
         original_config = (first.path / "config.toml").read_bytes()
 
-        renamed = app.rename_backup(self.config_dir, first.path, "Renamed backup")
+        renamed = app.rename_backup(self.config_dir, first.path, "Renamed")
 
         self.assertEqual(first.created_at, renamed.created_at)
-        self.assertEqual("Renamed backup", renamed.name)
         self.assertEqual(original_auth, (renamed.path / "auth.json").read_bytes())
         self.assertEqual(original_config, (renamed.path / "config.toml").read_bytes())
         with self.assertRaises(app.BackupNameConflictError):
             app.rename_backup(self.config_dir, renamed.path, second.name.lower())
 
-    def test_delete_backups_only_deletes_selected_directories(self) -> None:
-        self.write_config(self.config_dir, "A")
-        records = [app.create_or_reuse_backup(self.config_dir, f"item-{index}").record for index in range(3)]
+    def test_delete_only_removes_selected_profiles(self) -> None:
+        records = [self.create_profile(f"item-{index}", f"Provider {index}") for index in range(3)]
 
         app.delete_backups(self.config_dir, [records[0].path, records[2].path])
 
-        remaining = app.list_backup_records(self.config_dir)
-        self.assertEqual(["item-1"], [record.name for record in remaining])
+        self.assertEqual(["item-1"], [record.name for record in app.list_backup_records(self.config_dir)])
 
-    def test_restore_creates_named_safety_backup(self) -> None:
-        self.write_config(self.config_dir, "A", "https://a.example.com/v1")
-        backup_a = app.create_or_reuse_backup(self.config_dir, "A").record
-        app.save_codex_config(
-            self.config_dir,
-            "test-key",
-            "B",
-            "https://b.example.com/v1",
-            "gpt-5.4",
-            "A",
-        )
+    def test_restore_default_does_not_create_a_profile_or_delete_other_data(self) -> None:
+        self.write_config(self.config_dir, "A")
+        sessions = self.config_dir / "sessions"
+        sessions.mkdir()
+        marker = sessions / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
 
-        safety = app.restore_backup(self.config_dir, backup_a.path, "B")
+        app.restore_default_config(self.config_dir)
 
-        self.assertEqual("created", safety.status)
-        self.assertEqual("A", app.read_codex_config(self.config_dir).provider)
-        self.assertEqual({"A", "B"}, {record.name for record in app.list_backup_records(self.config_dir)})
+        self.assertFalse((self.config_dir / "auth.json").exists())
+        self.assertFalse((self.config_dir / "config.toml").exists())
+        self.assertEqual("keep", marker.read_text(encoding="utf-8"))
+        self.assertEqual([], app.list_backup_records(self.config_dir))
 
-    def test_existing_config_requires_a_name_before_every_destructive_operation(self) -> None:
-        operations = ("save", "template", "default", "restore")
-        for operation in operations:
-            with self.subTest(operation=operation):
-                config_dir = self.root / operation
-                self.write_config(config_dir, "A")
-                restore_source = app.create_or_reuse_backup(config_dir, "restore-source").record
-                before_auth = (config_dir / "auth.json").read_bytes()
-                before_config = (config_dir / "config.toml").read_bytes()
+    def test_unreadable_core_config_is_never_matched(self) -> None:
+        self.create_profile("A", "A")
+        (self.config_dir / "auth.json").write_text("{invalid", encoding="utf-8")
 
-                with self.assertRaises(app.BackupNameError):
-                    if operation == "save":
-                        app.save_codex_config(config_dir, "new-key", "B", "https://b.example.com/v1", "gpt-5.4", None)
-                    elif operation == "template":
-                        app.create_custom_template_config(config_dir, "new-key", "B", "https://b.example.com/v1", "gpt-5.4", None)
-                    elif operation == "default":
-                        app.restore_default_config(config_dir, None)
-                    else:
-                        app.restore_backup(config_dir, restore_source.path, None)
+        self.assertIsNone(app.find_matching_backup(self.config_dir))
 
-                self.assertEqual(before_auth, (config_dir / "auth.json").read_bytes())
-                self.assertEqual(before_config, (config_dir / "config.toml").read_bytes())
-
-    def test_legacy_duplicate_names_are_preserved_and_newest_matching_one_is_reused(self) -> None:
+    def test_legacy_duplicate_names_are_preserved_and_latest_matching_profile_is_found(self) -> None:
         older = self.config_dir / "backups" / "20260101-120000-before-save"
         newer = self.config_dir / "backups" / "20260102-120000-before-save"
         self.write_config(older, "A")
         self.write_config(newer, "B")
         self.write_config(self.config_dir, "B")
 
-        reusable = app.find_reusable_backup(self.config_dir, "before-save")
+        matching = app.find_matching_backup(self.config_dir)
 
-        self.assertEqual(newer.resolve(), reusable.path.resolve())
+        self.assertEqual(newer.resolve(), matching.path.resolve())
         self.assertEqual(2, len(app.named_backup_records(self.config_dir, "before-save")))
 
-    def test_chinese_provider_name_is_preserved_for_default_backup_name(self) -> None:
+    def test_chinese_provider_name_is_preserved_for_suggestion(self) -> None:
         self.write_config(self.config_dir, "中文服务")
 
         self.assertEqual("中文服务", app.read_codex_config(self.config_dir).provider)
-        self.assertEqual("中文服务", app.suggested_backup_name(self.config_dir))
+        self.assertEqual("中文服务", app.suggested_config_name("中文服务"))
 
-    def test_invalid_backup_names_are_rejected(self) -> None:
+    def test_invalid_profile_names_are_rejected(self) -> None:
         self.write_config(self.config_dir, "A")
-        for name in ("", "bad/name", "bad.", "x" * 41):
+        for name in (None, "", "bad/name", "bad.", "x" * 41):
             with self.subTest(name=name):
                 with self.assertRaises(app.BackupNameError):
-                    app.create_or_reuse_backup(self.config_dir, name)
+                    app.create_named_backup(self.config_dir, name)
 
     def test_drag_selection_adds_a_contiguous_range_to_existing_selection(self) -> None:
         items = ("a", "b", "c", "d", "e")
 
-        downward = app.drag_selection_items(items, "b", "d", ("e",))
-        upward = app.drag_selection_items(items, "d", "b", ("a",))
-
-        self.assertEqual(("b", "c", "d", "e"), downward)
-        self.assertEqual(("a", "b", "c", "d"), upward)
+        self.assertEqual(("b", "c", "d", "e"), app.drag_selection_items(items, "b", "d", ("e",)))
+        self.assertEqual(("a", "b", "c", "d"), app.drag_selection_items(items, "d", "b", ("a",)))
 
     def test_onboarding_is_only_automatic_before_first_close(self) -> None:
         self.assertTrue(app.should_show_onboarding({}))
