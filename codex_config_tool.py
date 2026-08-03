@@ -1625,9 +1625,13 @@ class CodexConfigApp(tk.Tk):
             canvas.configure(bg=background)
             canvas.delete("all")
             color = "#f3f4f6"
-            glyph = {"about": "ⓘ", "minimize": "−", "close": "×"}[kind]
-            font_size = 12 if kind == "about" else 17
-            canvas.create_text(21, 18, text=glyph, fill=color, font=("Segoe UI", font_size))
+            if kind == "about":
+                canvas.create_text(21, 19, text="ⓘ", fill=color, font=("Segoe UI", 12))
+            elif kind == "minimize":
+                canvas.create_line(16, 19, 26, 19, fill=color, width=1)
+            else:
+                canvas.create_line(17, 15, 25, 23, fill=color, width=1)
+                canvas.create_line(25, 15, 17, 23, fill=color, width=1)
 
         hover = "#c42b1c" if kind == "close" else "#3d3d3d"
         canvas.bind("<Enter>", lambda _event: draw(hover))
