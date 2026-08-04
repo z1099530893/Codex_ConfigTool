@@ -18,8 +18,10 @@ class BackupManagementTests(unittest.TestCase):
         self.settings_file_patch = patch.object(app, "SETTINGS_FILE", settings_dir / "settings.json")
         self.settings_dir_patch.start()
         self.settings_file_patch.start()
+        app.clear_profile_cache()
 
     def tearDown(self) -> None:
+        app.clear_profile_cache()
         self.settings_file_patch.stop()
         self.settings_dir_patch.stop()
         self.temp_dir.cleanup()
@@ -352,6 +354,78 @@ class BackupManagementTests(unittest.TestCase):
 
         self.assertEqual(["item-1"], [record.name for record in app.list_backup_records(self.config_dir)])
 
+    def test_deleting_active_profile_keeps_current_config_but_removes_saved_match(self) -> None:
+        active = self.create_profile("Active", "Provider A")
+        app.restore_backup(self.config_dir, active.path)
+        current_before = app.capture_config_files(self.config_dir)
+
+        app.delete_backups(self.config_dir, [active.path])
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertIsNone(app.find_matching_backup(self.config_dir))
+
+    def test_atomic_write_replace_failure_preserves_original_and_cleans_temp_file(self) -> None:
+        target = self.config_dir / "auth.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("original\n", encoding="utf-8")
+
+        with patch.object(app.os, "replace", side_effect=OSError("injected replace failure")):
+            with self.assertRaises(OSError):
+                app.write_text(target, "changed\n")
+
+        self.assertEqual("original\n", target.read_text(encoding="utf-8"))
+        self.assertEqual([], list(target.parent.glob(".auth.json.*.tmp")))
+
+    def test_save_config_rolls_back_both_files_when_second_replace_fails(self) -> None:
+        self.write_config(self.config_dir, "Original")
+        before = app.capture_config_files(self.config_dir)
+        real_replace = app.os.replace
+        failure_injected = False
+
+        def fail_first_config_replace(source, target) -> None:
+            nonlocal failure_injected
+            if Path(target).name == "config.toml" and not failure_injected:
+                failure_injected = True
+                raise OSError("injected config replace failure")
+            real_replace(source, target)
+
+        with patch.object(app.os, "replace", side_effect=fail_first_config_replace):
+            with self.assertRaises(OSError):
+                app.save_codex_config(
+                    self.config_dir,
+                    "changed-key",
+                    "Changed",
+                    "https://changed.example.com/v1",
+                    "gpt-5.6",
+                    persist_settings=False,
+                )
+
+        self.assertEqual(before, app.capture_config_files(self.config_dir))
+        self.assertEqual([], list(self.config_dir.glob(".*.tmp")))
+
+    def test_profile_signature_cache_reuses_data_and_invalidates_after_write(self) -> None:
+        self.write_config(self.config_dir, "Original")
+        app.clear_profile_cache()
+
+        with patch.object(
+            app,
+            "_build_backup_signature_uncached",
+            wraps=app._build_backup_signature_uncached,
+        ) as builder:
+            first = app.build_backup_signature(self.config_dir)
+            second = app.build_backup_signature(self.config_dir)
+            self.assertEqual(first, second)
+            self.assertEqual(1, builder.call_count)
+
+            app.write_text(
+                self.config_dir / "config.toml",
+                app.build_custom_template_config_toml("Changed", "https://changed.example.com/v1", "gpt-5.6"),
+            )
+            changed = app.build_backup_signature(self.config_dir)
+
+        self.assertEqual(2, builder.call_count)
+        self.assertNotEqual(first, changed)
+
     def test_restore_default_does_not_create_a_profile_or_delete_other_data(self) -> None:
         self.write_config(self.config_dir, "A")
         sessions = self.config_dir / "sessions"
@@ -403,14 +477,14 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(("b", "c", "d", "e"), app.drag_selection_items(items, "b", "d", ("e",)))
         self.assertEqual(("a", "b", "c", "d"), app.drag_selection_items(items, "d", "b", ("a",)))
 
-    def test_onboarding_is_only_automatic_before_first_close(self) -> None:
+    def test_onboarding_is_automatic_until_explicitly_disabled(self) -> None:
         self.assertTrue(app.should_show_onboarding({}))
         self.assertTrue(app.should_show_onboarding({app.ONBOARDING_SHOWN_KEY: False}))
-        self.assertFalse(app.should_show_onboarding({app.ONBOARDING_SHOWN_KEY: True}))
+        self.assertTrue(app.should_show_onboarding({app.ONBOARDING_SHOWN_KEY: True}))
 
-    def test_legacy_onboarding_setting_marks_guide_as_seen(self) -> None:
+    def test_only_explicit_hide_setting_disables_onboarding(self) -> None:
         self.assertFalse(app.should_show_onboarding({app.HIDE_ONBOARDING_KEY: True}))
-        self.assertFalse(app.should_show_onboarding({app.HIDE_ONBOARDING_KEY: False}))
+        self.assertTrue(app.should_show_onboarding({app.HIDE_ONBOARDING_KEY: False}))
 
 
 if __name__ == "__main__":

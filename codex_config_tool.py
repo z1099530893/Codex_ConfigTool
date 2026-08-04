@@ -3,8 +3,10 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import webbrowser
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,15 +19,20 @@ APP_VERSION = "1.2.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
-DONATION_IMAGE_NAME = "赞赏.png"
+DONATION_THUMBNAIL_IMAGE_NAME = "赞赏105.png"
+DONATION_DIALOG_IMAGE_NAME = "赞赏210.png"
 APP_ICON_PNG_NAME = "app_icon.png"
 APP_ICON_ICO_NAME = "app_icon.ico"
 TITLE_ICON_PNG_NAME = "app_icon_title.png"
+TITLE_ABOUT_ICON_NAME = "title_about.png"
+TITLE_MINIMIZE_ICON_NAME = "title_minimize.png"
+TITLE_CLOSE_ICON_NAME = "title_close.png"
 EYE_ICON_NAME = "eye_smooth.png"
 EYE_OFF_ICON_NAME = "eye_off_smooth.png"
 ABOUT_MARK_PNG_NAME = "app_icon_about.png"
 WINDOW_WIDTH = 820
 WINDOW_HEIGHT = 500
+STATUS_AREA_HEIGHT = 32
 DEFAULT_PROVIDER = "openai"
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_CUSTOM_PROVIDER = "custom"
@@ -43,6 +50,7 @@ HIDE_ONBOARDING_KEY = "hide_onboarding"
 ONBOARDING_SHOWN_KEY = "onboarding_shown"
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\z1099530893.CodexConfigTool"
 ERROR_ALREADY_EXISTS = 183
+PROFILE_CACHE_LIMIT = 512
 
 
 def resource_path(name: str) -> Path:
@@ -267,6 +275,16 @@ class BackupResult:
     record: BackupRecord | None = None
 
 
+@dataclass(frozen=True)
+class ProfileCacheEntry:
+    signature: BackupSignature | None
+    base_url: str
+
+
+_PROFILE_CACHE = OrderedDict()
+_PROFILE_CACHE_LOCK = threading.Lock()
+
+
 class ConfigConflictError(OSError):
     pass
 
@@ -288,9 +306,27 @@ def read_text(path: Path) -> str:
     return path.read_text(errors="replace")
 
 
-def write_text(path: Path, text: str) -> None:
+def atomic_write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_copy_file(source: Path, target: Path) -> None:
+    atomic_write_bytes(target, source.read_bytes())
 
 
 def is_codex_config_dir(path: Path) -> bool:
@@ -334,24 +370,17 @@ def load_settings() -> dict:
 def save_settings(config_dir: Path) -> None:
     settings = load_settings()
     settings["config_dir"] = str(config_dir)
-    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_text(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=2))
 
 
 def save_setting_value(key: str, value: object) -> None:
     settings = load_settings()
     settings[key] = value
-    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_text(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=2))
 
 
 def should_show_onboarding(settings: dict) -> bool:
-    if HIDE_ONBOARDING_KEY in settings:
-        return False
-    return not bool(settings.get(ONBOARDING_SHOWN_KEY, False))
+    return not bool(settings.get(HIDE_ONBOARDING_KEY, False))
 
 
 def normalized_path_key(path: Path) -> str:
@@ -743,7 +772,18 @@ def list_backups(config_dir: Path) -> list[Path]:
     return [record.path for record in list_backup_records(config_dir)]
 
 
-def build_backup_signature(config_dir: Path) -> BackupSignature | None:
+def _profile_fingerprint(config_dir: Path) -> tuple[tuple[bool, int, int, int], ...]:
+    fingerprint = []
+    for file_name in ("auth.json", "config.toml"):
+        try:
+            stat = (config_dir / file_name).stat()
+            fingerprint.append((True, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        except OSError:
+            fingerprint.append((False, 0, 0, 0))
+    return tuple(fingerprint)
+
+
+def _build_backup_signature_uncached(config_dir: Path) -> BackupSignature | None:
     auth_path = config_dir / "auth.json"
     config_path = config_dir / "config.toml"
     auth_exists = auth_path.exists()
@@ -806,6 +846,38 @@ def build_backup_signature(config_dir: Path) -> BackupSignature | None:
     )
 
 
+def cached_profile_entry(config_dir: Path) -> ProfileCacheEntry:
+    cache_key = normalized_path_key(config_dir)
+    fingerprint = _profile_fingerprint(config_dir)
+    with _PROFILE_CACHE_LOCK:
+        cached = _PROFILE_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            _PROFILE_CACHE.move_to_end(cache_key)
+            return cached[1]
+
+    signature = _build_backup_signature_uncached(config_dir)
+    base_url = signature.base_url if signature is not None and signature.base_url else DEFAULT_BASE_URL
+    if signature is None:
+        base_url = read_codex_config(config_dir).base_url
+    entry = ProfileCacheEntry(signature=signature, base_url=base_url)
+
+    with _PROFILE_CACHE_LOCK:
+        _PROFILE_CACHE[cache_key] = (fingerprint, entry)
+        _PROFILE_CACHE.move_to_end(cache_key)
+        while len(_PROFILE_CACHE) > PROFILE_CACHE_LIMIT:
+            _PROFILE_CACHE.popitem(last=False)
+    return entry
+
+
+def build_backup_signature(config_dir: Path) -> BackupSignature | None:
+    return cached_profile_entry(config_dir).signature
+
+
+def clear_profile_cache() -> None:
+    with _PROFILE_CACHE_LOCK:
+        _PROFILE_CACHE.clear()
+
+
 def named_backup_records(config_dir: Path, name: str, exclude_path: Path | None = None) -> list[BackupRecord]:
     name_key = name.casefold()
     excluded_key = normalized_path_key(exclude_path) if exclude_path is not None else None
@@ -852,8 +924,7 @@ def restore_config_files(config_dir: Path, snapshot: dict[str, bytes | None]) ->
             if path.exists():
                 path.unlink()
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
+            atomic_write_bytes(path, content)
 
 
 def create_named_backup(config_dir: Path, name: str | None) -> BackupRecord:
@@ -875,7 +946,7 @@ def create_named_backup(config_dir: Path, name: str | None) -> BackupRecord:
         for file_name in ("auth.json", "config.toml"):
             source = config_dir / file_name
             if source.exists():
-                shutil.copy2(source, backup_dir / file_name)
+                atomic_copy_file(source, backup_dir / file_name)
     except OSError:
         shutil.rmtree(backup_dir, ignore_errors=True)
         raise
@@ -1061,8 +1132,7 @@ def restore_backup(config_dir: Path, backup_dir: Path) -> None:
             source = backup_dir / file_name
             target = config_dir / file_name
             if source.exists():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
+                atomic_copy_file(source, target)
             elif target.exists():
                 target.unlink()
         save_settings(config_dir)
@@ -1136,7 +1206,7 @@ def update_auth_json(auth_path: Path, api_key: str) -> None:
         auth_data["OPENAI_API_KEY"] = api_key.strip()
     else:
         auth_data.pop("OPENAI_API_KEY", None)
-    auth_path.write_text(json.dumps(auth_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_text(auth_path, json.dumps(auth_data, ensure_ascii=False, indent=2) + "\n")
 
 
 def find_config_conflicts(config_lines: list[str], provider_id: str, auth_text: str | None) -> list[str]:
@@ -1237,10 +1307,15 @@ def save_codex_config(
             + "\n\n普通保存不会修改 model_provider 或重命名 Provider 段，以避免影响 Codex 聊天窗口状态。"
         )
 
-    update_auth_json(auth_path, api_key)
-    update_existing_config_toml(config_path, display_name, base_url, model)
-    if persist_settings:
-        save_settings(config_dir)
+    snapshot = capture_config_files(config_dir)
+    try:
+        update_auth_json(auth_path, api_key)
+        update_existing_config_toml(config_path, display_name, base_url, model)
+        if persist_settings:
+            save_settings(config_dir)
+    except OSError:
+        restore_config_files(config_dir, snapshot)
+        raise
 
 
 def restore_default_config(config_dir: Path) -> None:
@@ -1266,15 +1341,20 @@ def create_custom_template_config(
     persist_settings: bool = True,
 ) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = capture_config_files(config_dir)
     auth_path = config_dir / "auth.json"
-    if api_key is None:
-        if not auth_path.exists():
-            auth_path.write_text("{}\n", encoding="utf-8")
-    else:
-        update_auth_json(auth_path, api_key)
-    write_text(config_dir / "config.toml", build_custom_template_config_toml(provider_name, base_url, model))
-    if persist_settings:
-        save_settings(config_dir)
+    try:
+        if api_key is None:
+            if not auth_path.exists():
+                write_text(auth_path, "{}\n")
+        else:
+            update_auth_json(auth_path, api_key)
+        write_text(config_dir / "config.toml", build_custom_template_config_toml(provider_name, base_url, model))
+        if persist_settings:
+            save_settings(config_dir)
+    except OSError:
+        restore_config_files(config_dir, snapshot)
+        raise
 
 
 def build_requested_signature(
@@ -1405,30 +1485,32 @@ class CodexConfigApp(tk.Tk):
         self._window_drag_latest: tuple[int, int] | None = None
         self._window_drag_job: str | None = None
         self._minimized = False
+        self._native_hwnd: int | None = None
+        self._native_wndproc = None
+        self._original_wndproc: int | None = None
         self.app_icon_image = self._load_ui_image(APP_ICON_PNG_NAME)
         self.title_icon_image = self._load_ui_image(TITLE_ICON_PNG_NAME)
+        self.title_button_images = {
+            "about": self._load_ui_image(TITLE_ABOUT_ICON_NAME),
+            "minimize": self._load_ui_image(TITLE_MINIMIZE_ICON_NAME),
+            "close": self._load_ui_image(TITLE_CLOSE_ICON_NAME),
+        }
         self.eye_icon = self._load_ui_image(EYE_ICON_NAME)
         self.eye_off_icon = self._load_ui_image(EYE_OFF_ICON_NAME)
         self.about_mark_image = self._load_ui_image(ABOUT_MARK_PNG_NAME)
-        if self.app_icon_image is not None:
-            self.iconphoto(True, self.app_icon_image)
         try:
             self.iconbitmap(str(resource_path(APP_ICON_ICO_NAME)))
         except (OSError, tk.TclError):
             pass
-        self.donation_image = self._load_donation_image()
-        if self.donation_image:
-            factor = max((self.donation_image.width() + 111) // 112, 1)
-            self.donation_thumbnail = self.donation_image.subsample(factor, factor)
-            dialog_factor = max((self.donation_image.width() + 359) // 360, 1)
-            self.donation_dialog_image = self.donation_image.subsample(dialog_factor, dialog_factor)
-        else:
-            self.donation_thumbnail = None
-            self.donation_dialog_image = None
+        if self.title_icon_image is not None:
+            self.iconphoto(False, self.title_icon_image)
+        self.donation_thumbnail = self._load_ui_image(DONATION_THUMBNAIL_IMAGE_NAME)
+        self.donation_dialog_image = self._load_ui_image(DONATION_DIALOG_IMAGE_NAME)
         self._build_style()
         self._build_ui()
         self._center_main_window()
         self.bind("<Map>", self._restore_custom_frame, add="+")
+        self.bind("<Unmap>", self._track_window_minimized, add="+")
         self.bind("<Alt-F4>", lambda _event: self.destroy())
         self.bind(
             "<Control-a>",
@@ -1520,19 +1602,19 @@ class CodexConfigApp(tk.Tk):
         shell.pack(fill="both", expand=True)
         shell.pack_propagate(False)
 
-        title_bar = tk.Frame(shell, bg="#252525", height=38)
+        title_bar = tk.Frame(shell, bg="#000000", height=38)
         title_bar.pack(fill="x")
         title_bar.pack_propagate(False)
-        title_left = tk.Frame(title_bar, bg="#252525")
+        title_left = tk.Frame(title_bar, bg="#000000")
         title_left.pack(side="left", fill="y", padx=(10, 0))
-        icon_label = tk.Label(title_left, image=self.title_icon_image, bg="#252525", borderwidth=0)
+        icon_label = tk.Label(title_left, image=self.title_icon_image, bg="#000000", borderwidth=0)
         icon_label.pack(side="left", padx=(0, 7))
         icon_label.bind("<ButtonPress-1>", self._start_window_move)
         icon_label.bind("<B1-Motion>", self._move_window)
         title_label = tk.Label(
             title_left,
             text=APP_NAME,
-            bg="#252525",
+            bg="#000000",
             fg="#f4f4f4",
             font=("Microsoft YaHei UI", 9),
         )
@@ -1619,21 +1701,16 @@ class CodexConfigApp(tk.Tk):
         pill(bottom_y0, bottom_y1, False)
 
     def _title_icon_button(self, parent: tk.Misc, kind: str, command) -> tk.Canvas:
-        canvas = tk.Canvas(parent, width=42, height=38, bg="#252525", highlightthickness=0, cursor="hand2")
+        canvas = tk.Canvas(parent, width=42, height=38, bg="#000000", highlightthickness=0, cursor="hand2")
 
-        def draw(background: str = "#252525") -> None:
+        def draw(background: str = "#000000") -> None:
             canvas.configure(bg=background)
             canvas.delete("all")
-            color = "#f3f4f6"
-            if kind == "about":
-                canvas.create_text(21, 19, text="ⓘ", fill=color, font=("Segoe UI", 12))
-            elif kind == "minimize":
-                canvas.create_line(16, 19, 26, 19, fill=color, width=1)
-            else:
-                canvas.create_line(17, 15, 25, 23, fill=color, width=1)
-                canvas.create_line(25, 15, 17, 23, fill=color, width=1)
+            image = self.title_button_images[kind]
+            if image is not None:
+                canvas.create_image(21, 19, image=image, anchor="center")
 
-        hover = "#c42b1c" if kind == "close" else "#3d3d3d"
+        hover = "#c42b1c" if kind == "close" else "#292929"
         canvas.bind("<Enter>", lambda _event: draw(hover))
         canvas.bind("<Leave>", lambda _event: draw())
         canvas.bind("<Button-1>", lambda _event: command())
@@ -1718,31 +1795,31 @@ class CodexConfigApp(tk.Tk):
     def _build_current_page(self) -> None:
         page = self._new_page("current")
         header = tk.Frame(page, bg="#f3f4f7")
-        header.pack(fill="x", padx=28, pady=(16, 64))
+        header.pack(fill="x", padx=28, pady=(16, 11))
         title_row = tk.Frame(header, bg="#f3f4f7")
         title_row.pack(fill="x")
-        status_dot = tk.Canvas(title_row, width=12, height=22, bg="#f3f4f7", highlightthickness=0)
-        status_dot.create_oval(3, 8, 9, 14, fill="#2e9b63", outline="")
+        status_dot = tk.Canvas(title_row, width=12, height=25, bg="#f3f4f7", highlightthickness=0)
+        status_dot.create_oval(3, 9, 9, 15, fill="#2e9b63", outline="")
         status_dot.pack(side="left", padx=(0, 5))
-        status_font = ("Microsoft YaHei UI", 11, "bold")
+        status_font = ("Microsoft YaHei UI", 13, "bold")
         tk.Label(title_row, textvariable=self.current_config_prefix_var, bg="#f3f4f7", fg="#20242b", font=status_font, padx=0, borderwidth=0).pack(side="left")
         tk.Label(title_row, textvariable=self.current_config_name_var, bg="#f3f4f7", fg="#20242b", font=status_font, padx=0, borderwidth=0).pack(side="left")
         tk.Label(title_row, textvariable=self.current_config_suffix_var, bg="#f3f4f7", fg="#20242b", font=status_font, padx=0, borderwidth=0).pack(side="left")
         tk.Label(
             header,
-            text="欢迎使用 Codex 配置助手，如果觉得软件好用，请扫描左侧二维码，支持作者。",
+            text="欢迎使用Codex配置助手，如果觉得软件好用，请点击左侧二维码并扫描，支持作者。",
             bg="#f3f4f7",
             fg="#69707d",
             font=("Microsoft YaHei UI", 8),
-        ).pack(anchor="w", pady=(5, 0))
+        ).pack(anchor="w", pady=(4, 0))
 
         path_panel = self._panel(page, (12, 9))
         tk.Label(path_panel, text="Codex 配置目录", bg="#ffffff", fg="#2a3038", font=("Microsoft YaHei UI", 8, "bold")).pack(anchor="w", pady=(0, 6))
         path_row = tk.Frame(path_panel, bg="#ffffff")
         path_row.pack(fill="x")
         ttk.Entry(path_row, textvariable=self.path_var, state="readonly", style="Readonly.TEntry").pack(side="left", fill="x", expand=True, ipady=1)
-        ttk.Button(path_row, text="浏览...", command=self.choose_path, style="Secondary.TButton", width=10).pack(side="left", padx=(8, 0), ipady=1)
-        ttk.Button(path_row, text="新增配置", command=self._show_profile_editor, style="Secondary.TButton", width=11).pack(side="left", padx=(8, 0), ipady=1)
+        ttk.Button(path_row, text="浏览...", command=self.choose_path, style="Secondary.TButton", width=10).pack(side="left", padx=(8, 0), ipady=3)
+        ttk.Button(path_row, text="新增配置", command=self._show_profile_editor, style="Secondary.TButton", width=11).pack(side="left", padx=(8, 0), ipady=3)
 
         details = self._panel(page, (16, 8))
         details.columnconfigure(1, weight=1)
@@ -1829,13 +1906,49 @@ class CodexConfigApp(tk.Tk):
 
     def _minimize_window(self) -> None:
         self._minimized = True
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+                ctypes.windll.user32.ShowWindow(hwnd, 6)
+                return
+            except (AttributeError, OSError):
+                pass
         self.overrideredirect(False)
         self.iconify()
 
     def _restore_custom_frame(self, _event=None) -> None:
-        if self._minimized and self.state() == "normal":
-            self._minimized = False
-            self.after_idle(lambda: (self.overrideredirect(True), self._set_appwindow_style()))
+        if not self._minimized:
+            return
+        self.after_idle(self._finish_taskbar_restore)
+
+    def _track_window_minimized(self, _event=None) -> None:
+        self.after_idle(self._update_minimized_state)
+
+    def _update_minimized_state(self) -> None:
+        if not self.winfo_exists():
+            return
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+                if ctypes.windll.user32.IsIconic(hwnd):
+                    self._minimized = True
+                    return
+            except (AttributeError, OSError):
+                pass
+        if self.state() == "iconic":
+            self._minimized = True
+
+    def _finish_taskbar_restore(self) -> None:
+        if not self.winfo_exists() or self.state() != "normal":
+            return
+        self._minimized = False
+        if os.name != "nt":
+            self.overrideredirect(True)
+            self._set_appwindow_style()
 
     def _set_appwindow_style(self) -> None:
         if os.name != "nt" or not self.winfo_exists():
@@ -1843,13 +1956,66 @@ class CodexConfigApp(tk.Tk):
         try:
             import ctypes
 
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+            self._install_native_frame_handler(hwnd)
+            window_style = ctypes.windll.user32.GetWindowLongW(hwnd, -16)
+            window_style |= 0x00C00000 | 0x00080000 | 0x00020000
+            ctypes.windll.user32.SetWindowLongW(hwnd, -16, window_style)
             extended_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
             extended_style = (extended_style & ~0x00000080) | 0x00040000
             ctypes.windll.user32.SetWindowLongW(hwnd, -20, extended_style)
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0047)
         except (AttributeError, OSError):
             pass
+
+    def _install_native_frame_handler(self, hwnd: int) -> None:
+        if self._native_hwnd == hwnd and self._native_wndproc is not None:
+            return
+
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        wndproc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.CallWindowProcW.argtypes = (
+            ctypes.c_void_p,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        user32.CallWindowProcW.restype = ctypes.c_ssize_t
+
+        original_wndproc = user32.GetWindowLongPtrW(hwnd, -4)
+        if not original_wndproc:
+            return
+
+        @wndproc_type
+        def custom_wndproc(window, message, wparam, lparam):
+            if message == 0x0083 and wparam:
+                return 0
+            return user32.CallWindowProcW(original_wndproc, window, message, wparam, lparam)
+
+        previous_wndproc = user32.SetWindowLongPtrW(
+            hwnd,
+            -4,
+            ctypes.cast(custom_wndproc, ctypes.c_void_p),
+        )
+        if not previous_wndproc:
+            return
+        self._native_hwnd = hwnd
+        self._original_wndproc = int(previous_wndproc)
+        self._native_wndproc = custom_wndproc
 
     def _build_profiles_page(self) -> None:
         page = self._new_page("profiles")
@@ -1857,15 +2023,15 @@ class CodexConfigApp(tk.Tk):
 
         toolbar = tk.Frame(page, bg="#f3f4f7")
         toolbar.pack(fill="x", padx=28, pady=(0, 10))
-        ttk.Button(toolbar, text="打开配置库目录", command=self.open_backup_dir, style="Secondary.TButton").pack(side="left", ipady=1)
-        ttk.Button(toolbar, text="新增配置", command=self._show_profile_editor, style="Secondary.TButton").pack(side="left", padx=(8, 0), ipady=1)
+        ttk.Button(toolbar, text="打开配置库目录", command=self.open_backup_dir, style="Secondary.TButton").pack(side="left", ipady=3)
+        ttk.Button(toolbar, text="新增配置", command=self._show_profile_editor, style="Secondary.TButton").pack(side="left", padx=(8, 0), ipady=3)
         self.profile_switch_button = ttk.Button(
             toolbar,
             text="切换到该配置",
             command=self._switch_selected_profile,
             style="Primary.TButton",
         )
-        self.profile_switch_button.pack(side="right")
+        self.profile_switch_button.pack(side="right", ipady=2)
         search_entry = ttk.Entry(toolbar, textvariable=self.profile_search_var, width=24)
         search_entry.pack(side="right", padx=(0, 10), ipady=1)
         tk.Label(toolbar, text="搜索", bg="#f3f4f7", fg="#5f6773", font=("Microsoft YaHei UI", 8)).pack(side="right", padx=(0, 6))
@@ -1888,7 +2054,7 @@ class CodexConfigApp(tk.Tk):
             highlightcolor="#e2e5e8",
             takefocus=False,
         )
-        tree_panel.pack(fill="both", expand=True, padx=28, pady=(0, 28))
+        tree_panel.pack(fill="both", expand=True, padx=28, pady=(0, STATUS_AREA_HEIGHT))
         tree_frame = tk.Frame(tree_panel, bg="#ffffff")
         tree_frame.pack(fill="both", expand=True)
         self.profile_tree = ttk.Treeview(
@@ -1971,8 +2137,8 @@ class CodexConfigApp(tk.Tk):
             records.sort(key=lambda item: normalized_path_key(item.path) != active_key)
         selected_items = []
         for index, record in enumerate(records):
-            config = read_codex_config(record.path)
-            if query and query not in record.name.casefold() and query not in config.base_url.casefold():
+            profile_entry = cached_profile_entry(record.path)
+            if query and query not in record.name.casefold() and query not in profile_entry.base_url.casefold():
                 continue
             item = f"profile-{index}"
             record_key = normalized_path_key(record.path)
@@ -1982,7 +2148,7 @@ class CodexConfigApp(tk.Tk):
                 "",
                 "end",
                 iid=item,
-                values=(display_name, config.base_url),
+                values=(display_name, profile_entry.base_url),
                 tags=("active",) if record_key == active_key else (),
             )
             if record_key in previous_paths:
@@ -2056,8 +2222,14 @@ class CodexConfigApp(tk.Tk):
         self._update_profile_buttons()
         record = self.profile_records_by_item[item]
         menu = tk.Menu(self, tearoff=False)
-        menu.add_command(label="编辑配置", command=lambda: self._show_profile_editor(record))
-        menu.add_command(label="删除配置", command=lambda: self._delete_profile_records([record]))
+        if self.profile_multi_mode:
+            menu.add_command(
+                label="删除所选配置",
+                command=lambda: self._delete_profile_records(self._selected_profile_records()),
+            )
+        else:
+            menu.add_command(label="编辑配置", command=lambda: self._show_profile_editor(record))
+            menu.add_command(label="删除配置", command=lambda: self._delete_profile_records([record]))
         menu.add_separator()
         menu.add_command(
             label="退出多选" if self.profile_multi_mode else "多选",
@@ -2079,7 +2251,7 @@ class CodexConfigApp(tk.Tk):
             self.show_error(f"切换配置失败：\n{exc}")
             return
         set_official_login_mode(self.current_path(), False)
-        self.load_path(self.current_path())
+        self.reload_current()
         self.refresh_profiles(selected.path)
         self._notify(f"已切换到配置：{selected.name}；请重新启动 Codex。")
 
@@ -2124,7 +2296,7 @@ class CodexConfigApp(tk.Tk):
         except OSError as exc:
             self.show_error(f"删除配置失败：\n{exc}")
             return
-        self.load_path(self.current_path())
+        self.reload_current()
         self.refresh_profiles()
         self._notify(f"已删除 {len(records)} 个配置。")
 
@@ -2392,18 +2564,13 @@ class CodexConfigApp(tk.Tk):
         content_left = 142
         content_width = self.winfo_width() - content_left
         x = self.winfo_rootx() + content_left + max((content_width - toast.winfo_width()) // 2, 8)
-        y = self.winfo_rooty() + self.winfo_height() - toast.winfo_height() - 5
+        status_top = self.winfo_rooty() + self.winfo_height() - STATUS_AREA_HEIGHT
+        y = status_top + max((STATUS_AREA_HEIGHT - toast.winfo_height()) // 2, 0)
         toast.geometry(f"+{x}+{y}")
         toast.after(duration, lambda: toast.winfo_exists() and toast.destroy())
 
-    def _load_donation_image(self) -> tk.PhotoImage | None:
-        try:
-            return tk.PhotoImage(file=str(resource_path(DONATION_IMAGE_NAME)))
-        except (OSError, tk.TclError):
-            return None
-
     def show_donation_dialog(self) -> None:
-        if self.donation_image is None:
+        if self.donation_dialog_image is None:
             self.show_error("赞赏码图片未找到。")
             return
 
@@ -2436,30 +2603,50 @@ class CodexConfigApp(tk.Tk):
             return
 
         dialog = tk.Toplevel(self)
-        dialog.title("新手引导")
+        dialog.title(APP_NAME)
         dialog.transient(self)
         dialog.grab_set()
         dialog.resizable(False, False)
-        dialog.configure(bg="#f3f4f7")
 
-        container = ttk.Frame(dialog, padding=24)
+        container = ttk.Frame(dialog, padding=18)
         container.pack(fill="both", expand=True)
-        ttk.Label(container, text="欢迎使用 Codex 配置助手", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(container, text="新增配置", style="Panel.TLabel", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(12, 5))
-        ttk.Label(container, text="打开“新增配置”，填写配置名称和服务商提供的 API 信息。保存并使用后，请关闭本工具并重新启动 Codex。", justify="left", wraplength=430).pack(anchor="w")
-        ttk.Label(container, text="切换配置", style="Panel.TLabel", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(16, 5))
-        ttk.Label(container, text="打开“切换配置”，选择已保存的配置并切换；切换完成后同样需要重新启动 Codex。", justify="left", wraplength=430).pack(anchor="w")
+        content = ttk.Frame(container)
+        content.pack(fill="x", expand=True)
+        tk.Label(
+            content,
+            text="?",
+            bg="#2f6f5e",
+            fg="#ffffff",
+            width=2,
+            height=1,
+            font=("Segoe UI", 14, "bold"),
+        ).pack(side="left", padx=(0, 14), anchor="n")
+        ttk.Label(
+            content,
+            text="是否打开新手引导？\n\n选择“是”后，将进入新手引导页面。",
+            wraplength=380,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
 
-        def close() -> None:
-            save_setting_value(ONBOARDING_SHOWN_KEY, True)
+        button_row = ttk.Frame(container)
+        button_row.pack(fill="x", pady=(18, 0))
+
+        def close(action: str) -> None:
+            if action == "never":
+                save_setting_value(HIDE_ONBOARDING_KEY, True)
             dialog.destroy()
+            if action == "open":
+                self.show_page("guide")
             self.lift()
             self.focus_force()
 
-        dialog.protocol("WM_DELETE_WINDOW", close)
-        dialog.bind("<Return>", lambda _event: close())
-        dialog.bind("<Escape>", lambda _event: close())
-        self.center_window(dialog, 520)
+        ttk.Button(button_row, text="不再弹出", command=lambda: close("never"), style="Secondary.TButton", width=10).pack(side="left")
+        ttk.Button(button_row, text="否", command=lambda: close("close"), style="Secondary.TButton", width=9).pack(side="right")
+        ttk.Button(button_row, text="是", command=lambda: close("open"), style="Secondary.TButton", width=9).pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close("close"))
+        dialog.bind("<Return>", lambda _event: close("open"))
+        dialog.bind("<Escape>", lambda _event: close("close"))
+        self.center_window(dialog, 500, 168)
         dialog.focus_force()
 
     def show_custom_dialog(self, message: str, kind: str = "info", parent: tk.Toplevel | None = None) -> bool:

@@ -18,6 +18,7 @@
 - 每个配置目录格式为 `yyyyMMdd-HHmmss-名称`
 - 配置库配置永久保留，无数量限制，不自动清理，不自动更新时间
 - `%APPDATA%\CodexConfigTool\settings.json` 保存工具设置和官方登录模式
+- 删除配置库项目不会修改当前目录的 `auth.json` 和 `config.toml`；匹配项被删除后当前状态显示为“未保存配置”
 
 ## 配置安全规则
 
@@ -33,6 +34,10 @@
 
 恢复官方登录只删除当前目录的 `auth.json` 和 `config.toml`，并保留其他文件和配置库。
 
+所有生产写入必须经过 `atomic_write_bytes`、`write_text` 或 `atomic_copy_file`。原子写入在目标目录创建临时文件，刷新并 `fsync` 后通过 `os.replace` 替换。`save_codex_config` 和 `create_custom_template_config` 使用双文件快照回滚，新增写入路径不得绕过这些辅助函数。
+
+配置库读取通过 `cached_profile_entry` 缓存签名和 Base URL。缓存键是规范化目录路径，失效依据是 `auth.json/config.toml` 的存在状态、大小、`mtime_ns` 和 `ctime_ns`；LRU 上限为 512。不要缓存 API Key 的展示文本，也不要取消基于文件状态的自动失效。
+
 ## 代码入口
 
 - `CodexConfigApp`：主窗口、页面、弹窗和用户交互
@@ -40,6 +45,8 @@
 - `read_codex_config` / `save_codex_config`：读取和原位保存当前配置
 - `create_custom_template_config`：创建稳定的自定义 Provider 模板
 - `build_backup_signature` / `build_requested_signature`：生成配置核心签名
+- `cached_profile_entry` / `clear_profile_cache`：配置签名和列表搜索缓存
+- `atomic_write_bytes` / `atomic_copy_file`：同目录原子写入和复制
 - `find_matching_backup`：查找内容相同的配置库项目
 - `create_named_backup` / `restore_backup`：创建和切换配置库项目
 - `save_config_profile` / `update_config_profile`：保存新增配置和编辑配置
@@ -52,13 +59,16 @@
 
 - 主窗口固定为 `820 × 500`，无最大化按钮
 - 自定义深色标题栏提供关于、最小化、关闭和窗口拖动
+- 主窗口通过保留 `WS_CAPTION` 并拦截 `WM_NCCALCSIZE` 获得 Windows 任务栏动画；`_native_wndproc` 必须由实例持续持有，不能改成局部临时回调
+- 主窗口任务栏只使用 `app_icon_title.png`；弹窗和 EXE 使用 `app_icon.ico`，不要用 `iconphoto(True, ...)` 覆盖全部弹窗
 - 左侧页面顺序为当前配置、切换配置、官方登录、新手引导
 - 当前页面只读；配置编辑统一从新增配置或切换配置页面进入
 - 配置列表外围始终为浅灰细边框，选中只改变对应行背景
 - 次要按钮使用统一浅灰背景，绿色按钮表示主要操作
 - 瞬时消息使用无背景纯文字，位于右侧页面底部留白
 - 眼睛按钮不显示悬停提示
-- 首次启动的新手引导居中显示一次，之后只从导航页手动查看
+- 多选右键菜单只能批量删除所选配置或退出多选，不能进入单项编辑
+- 启动时询问是否打开新手引导；“是”进入导航页，“否”直接进入软件；仅在明确点击“不再弹出”后停止自动询问
 
 ## 单实例和退出
 
@@ -69,13 +79,18 @@
 PyInstaller 必须包含：
 
 ```text
-赞赏.png
+赞赏105.png
+赞赏210.png
 app_icon.png
 app_icon_title.png
 app_icon_about.png
+title_about.png
+title_minimize.png
+title_close.png
 eye_smooth.png
 eye_off_smooth.png
 app_icon.ico
+version_info.txt
 ```
 
 使用 `build.bat` 或 `build.ps1` 打包。`dist/`、`build/`、`*.spec`、`__pycache__/` 已加入 `.gitignore`，不提交到源码仓库。EXE 上传到 GitHub Releases。
@@ -88,10 +103,15 @@ app_icon.ico
 2. `python -m unittest discover -s tests -q`
 3. 在临时 `APPDATA`、`CODEX_HOME` 下验证新增、编辑、切换、删除和官方登录
 4. 验证取消保存不会修改任何配置文件
-5. 验证超过 5 个配置仍全部保留
-6. 验证列表选择、拖选、全选、滚动条和弹窗按钮的 Windows 界面效果
-7. 关闭程序后确认进程结束，再进行 PyInstaller 打包
+5. 验证原子替换失败时旧文件保持不变、临时文件被清理、双文件事务完整回滚
+6. 验证缓存重复读取命中，并在文件替换后自动失效
+7. 验证超过 5 个配置仍全部保留
+8. 验证列表选择、拖选、全选、滚动条和弹窗按钮的 Windows 界面效果
+9. 连续验证任务栏最小化/恢复动画，确认没有第二条系统标题栏
+10. 关闭程序后确认进程结束，再进行 PyInstaller 打包，并检查 EXE 详细信息中的 `1.2.0` 版本
 
 ## 后续修改原则
 
 保持配置解析、Provider ID、官方登录流程和 Codex 桌面状态保护不变。涉及配置文件写入时，必须先在临时目录验证；完成后同步更新 README、HANDOFF、CHANGELOG 和版本号，并运行完整测试。
+
+已明确不做：引入正式 TOML 解析器、拆分主程序、外部并发检测、扫描路径重构、GUI 自动化测试和合并两套构建脚本。除非需求重新确认，不要把这些项目作为顺手重构加入。
