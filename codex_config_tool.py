@@ -19,8 +19,8 @@ APP_VERSION = "1.2.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
-DONATION_THUMBNAIL_IMAGE_NAME = "赞赏105.png"
-DONATION_DIALOG_IMAGE_NAME = "赞赏210.png"
+DONATION_THUMBNAIL_IMAGE_NAME = "donation_105.png"
+DONATION_DIALOG_IMAGE_NAME = "donation_210.png"
 APP_ICON_PNG_NAME = "app_icon.png"
 APP_ICON_ICO_NAME = "app_icon.ico"
 TITLE_ICON_PNG_NAME = "app_icon_title.png"
@@ -55,7 +55,7 @@ PROFILE_CACHE_LIMIT = 512
 
 def resource_path(name: str) -> Path:
     base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    return base_dir / name
+    return base_dir / "assets" / name
 
 
 def acquire_single_instance(name: str = SINGLE_INSTANCE_MUTEX_NAME) -> int | None:

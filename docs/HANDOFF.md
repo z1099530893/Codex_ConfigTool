@@ -76,24 +76,24 @@
 
 ## 资源和打包
 
-PyInstaller 必须包含：
+PyInstaller 必须从 `assets/` 包含：
 
 ```text
-赞赏105.png
-赞赏210.png
-app_icon.png
-app_icon_title.png
-app_icon_about.png
-title_about.png
-title_minimize.png
-title_close.png
-eye_smooth.png
-eye_off_smooth.png
-app_icon.ico
+assets/donation_105.png
+assets/donation_210.png
+assets/app_icon.png
+assets/app_icon_title.png
+assets/app_icon_about.png
+assets/title_about.png
+assets/title_minimize.png
+assets/title_close.png
+assets/eye_smooth.png
+assets/eye_off_smooth.png
+assets/app_icon.ico
 version_info.txt
 ```
 
-使用 `build.bat` 或 `build.ps1` 打包。`dist/`、`build/`、`*.spec`、`__pycache__/` 已加入 `.gitignore`，不提交到源码仓库。EXE 上传到 GitHub Releases。
+使用 `scripts\build.bat` 或 `scripts\build.ps1` 打包。`dist/`、`build/`、`*.spec`、`__pycache__/` 已加入 `.gitignore`，不提交到源码仓库。EXE 上传到 GitHub Releases。
 
 ## 验证清单
 
@@ -118,4 +118,4 @@ version_info.txt
 
 ## Developer test helper
 
-`reset_onboarding.bat` is provided for repeatable onboarding testing. Run it from the project root after choosing "Do not show again" in the application. It updates `%APPDATA%\CodexConfigTool\settings.json` by removing only `hide_onboarding`; it must not delete or replace the entire settings file, and it does not modify the Codex configuration directory or official login files. Restart the application after the script completes to show the onboarding prompt again.
+`scripts\reset_onboarding.bat` is provided for repeatable onboarding testing. Run it after choosing "Do not show again" in the application. It updates `%APPDATA%\CodexConfigTool\settings.json` by removing only `hide_onboarding`; it must not delete or replace the entire settings file, and it does not modify the Codex configuration directory or official login files. Restart the application after the script completes to show the onboarding prompt again.

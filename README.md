@@ -79,13 +79,13 @@ python -m unittest discover -s tests -q
 关闭正在运行的程序后执行：
 
 ```bat
-build.bat
+scripts\build.bat
 ```
 
 或：
 
 ```powershell
-.\build.ps1
+.\scripts\build.ps1
 ```
 
 产物位于 `dist/CodexConfigTool.exe`。`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。源码仓库只提交源码、文档、测试、构建脚本和图片资源；`.exe` 应作为 GitHub Release 附件发布，不提交到源码仓库。
@@ -95,16 +95,11 @@ build.bat
 ```text
 codex_config_tool.py   主程序
 tests/                 标准库测试
-build.bat              Windows 批处理打包脚本
-build.ps1              PowerShell 打包脚本
-README.md              项目说明
-HANDOFF.md             开发交接文档
-CHANGELOG.md           当前版本变更摘要
+assets/               图片、图标和赞赏码
+scripts/              构建脚本和测试补丁脚本
+docs/                 项目说明、交接文档和变更记录
+CodexConfigTool.spec   PyInstaller 配置
 version_info.txt       Windows EXE 版本资源
-赞赏105.png            侧栏赞赏码
-赞赏210.png            弹窗赞赏码
-app_icon*.png/.ico     软件图标资源
-eye_*_smooth.png       API Key 眼睛图标
 ```
 
 ## 联系
@@ -113,6 +108,6 @@ eye_*_smooth.png       API Key 眼睛图标
 - 邮箱：1099530893@qq.com
 - 项目：https://github.com/z1099530893/Codex_ConfigTool
 
-### 重置“新手引导”弹窗提示
+## 重置“新手引导”弹窗提示
 
-“新手引导”弹窗一旦被禁用就不再弹出，为了方便开发测试，开发者可以运行“ reset_onboarding.bat ” 脚本，该脚本可以重置这个弹窗，并且可以放在任意目录运行，脚本只开启弹窗，其余所有工具设置将被保留。运行后关闭并重新启动 Codex Config Tool，即可再次显示“新手引导”。
+“新手引导”弹窗一旦被禁用就不再弹出，为了方便开发测试，开发者可以运行“ scripts/reset_onboarding.bat ”脚本，该脚本可以重置这个弹窗，并且可以放在任意目录运行，脚本只开启弹窗，其余所有工具设置将被保留。运行后关闭并重新启动 Codex Config Tool，即可再次显示“新手引导”。
