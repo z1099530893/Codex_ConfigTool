@@ -40,6 +40,8 @@ yyyyMMdd-HHmmss-配置名称/
 
 删除配置只删除 `backups/` 中的已保存记录，不修改当前 Codex 目录中的 `auth.json` 和 `config.toml`。如果删除了与当前内容匹配的配置，Codex 仍继续使用当前文件，主界面状态改为“未保存配置”。
 
+新增配置会先复制当前配置的 `auth.json` 和 `config.toml`，再只修改 API Key、Provider 显示名称、Base URL 和 Model。这样可以保留 Codex 身份字段以及其他桌面状态，避免保存并使用新配置后被识别为新的 Codex 身份。当前目录没有配置文件时才会使用新模板。
+
 普通保存只修改以下字段：
 
 - `auth.json` 中的 `OPENAI_API_KEY`
@@ -47,7 +49,7 @@ yyyyMMdd-HHmmss-配置名称/
 - 当前 Provider 段的 `base_url`
 - 顶层 `model`
 
-程序不会修改 `model_provider`、Provider 段名、聊天记录、SQLite 数据库或 Codex 桌面状态。无法安全识别的复杂配置会停止处理并提示用户。
+程序不会修改聊天记录、SQLite 数据库、日志或未涉及的 Codex 桌面状态。普通编辑不会修改现有配置的 `model_provider` 或 Provider 段名；只有当前配置是内置 openai 且需要新增自定义 Provider 时，才会保留其他内容并添加新的 Provider 段。无法安全识别的复杂配置会停止处理并提示用户。
 
 写入 `auth.json`、`config.toml` 和工具设置时，程序会先在目标目录写入并同步临时文件，再通过 `os.replace` 原子替换。保存两份核心配置时任一步骤失败，程序会恢复操作前的两份文件。配置库签名和列表搜索信息最多缓存 512 个目录，并依据文件是否存在、大小、纳秒修改时间和创建时间自动失效。
 

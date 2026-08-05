@@ -629,8 +629,14 @@ def replace_existing_section_value(lines: list[str], section_name: str, key: str
     return output
 
 
-def append_provider_section(lines: list[str], provider: str, base_url: str) -> list[str]:
+def append_provider_section(
+    lines: list[str],
+    provider: str,
+    base_url: str,
+    display_name: str | None = None,
+) -> list[str]:
     output = list(lines)
+    display_name = display_name.strip() if display_name is not None else provider
     if output and not output[-1].endswith("\n"):
         output[-1] += "\n"
     if output and output[-1].strip():
@@ -638,7 +644,7 @@ def append_provider_section(lines: list[str], provider: str, base_url: str) -> l
     output.extend(
         [
             f"[model_providers.{provider}]\n",
-            f"name = {quote_toml_string(provider)}\n",
+            f"name = {quote_toml_string(display_name)}\n",
             f"base_url = {quote_toml_string(base_url)}\n",
             'wire_api = "responses"\n',
             "requires_openai_auth = true\n",
@@ -927,6 +933,15 @@ def restore_config_files(config_dir: Path, snapshot: dict[str, bytes | None]) ->
             atomic_write_bytes(path, content)
 
 
+def copy_config_files(source_dir: Path, target_dir: Path) -> None:
+    """Copy the current Codex files before changing only managed fields."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for file_name in ("auth.json", "config.toml"):
+        source = source_dir / file_name
+        if source.exists():
+            shutil.copy2(source, target_dir / file_name)
+
+
 def create_named_backup(config_dir: Path, name: str | None) -> BackupRecord:
     has_source = any((config_dir / file_name).exists() for file_name in ("auth.json", "config.toml"))
     if not has_source:
@@ -962,6 +977,12 @@ def create_config_profile(
     model: str,
     apply_to_current: bool = False,
 ) -> BackupRecord:
+    state, issues = classify_config_for_editing(config_dir)
+    if state == "conflict":
+        raise ConfigConflictError(
+            "当前配置包含复杂或冲突内容，无法安全新增配置。\n\n"
+            + "\n".join(f"- {item}" for item in issues)
+        )
     name = validate_new_backup_name(config_dir, name)
     signature = build_requested_signature(
         config_dir,
@@ -969,7 +990,7 @@ def create_config_profile(
         provider_name,
         base_url,
         model,
-        "needs_template",
+        state,
     )
     existing = find_matching_backup(config_dir, signature)
     if existing is not None:
@@ -984,13 +1005,14 @@ def create_config_profile(
     current_snapshot = capture_config_files(config_dir) if apply_to_current else None
     profile_dir.mkdir(parents=True, exist_ok=False)
     try:
-        create_custom_template_config(
+        create_profile_from_current_config(
+            config_dir,
             profile_dir,
             api_key,
             provider_name,
             base_url,
             model,
-            persist_settings=False,
+            state,
         )
         record = backup_record_from_path(profile_dir)
         if apply_to_current:
@@ -1042,7 +1064,7 @@ def update_config_profile(
     updated_path = profile_dir
     try:
         if state == "needs_template":
-            create_custom_template_config(
+            save_custom_provider_config(
                 profile_dir,
                 api_key,
                 provider_name,
@@ -1357,6 +1379,75 @@ def create_custom_template_config(
         raise
 
 
+def save_custom_provider_config(
+    config_dir: Path,
+    api_key: str,
+    provider_name: str,
+    base_url: str,
+    model: str,
+    persist_settings: bool = True,
+) -> None:
+    """Add a custom Provider while preserving unrelated current settings."""
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "config.toml"
+    if not config_path.exists():
+        create_custom_template_config(
+            config_dir,
+            api_key,
+            provider_name,
+            base_url,
+            model,
+            persist_settings=persist_settings,
+        )
+        return
+
+    lines = read_text(config_path).splitlines(keepends=True)
+    lines = replace_or_insert_top_level(lines, "model_provider", TEMPLATE_PROVIDER_ID)
+    lines = replace_or_insert_top_level(lines, "model", model.strip() or TEMPLATE_MODEL)
+    provider_section = f"model_providers.{TEMPLATE_PROVIDER_ID}"
+    if count_sections(lines, provider_section):
+        lines = replace_or_insert_section_value(lines, provider_section, "name", provider_name)
+        lines = replace_or_insert_section_value(lines, provider_section, "base_url", base_url)
+    else:
+        lines = append_provider_section(lines, TEMPLATE_PROVIDER_ID, base_url, provider_name)
+
+    update_auth_json(config_dir / "auth.json", api_key)
+    write_text(config_path, "".join(lines))
+    if persist_settings:
+        save_settings(config_dir)
+
+
+def create_profile_from_current_config(
+    source_dir: Path,
+    profile_dir: Path,
+    api_key: str,
+    provider_name: str,
+    base_url: str,
+    model: str,
+    state: str,
+) -> None:
+    """Clone the current files, then update only the requested Provider fields."""
+    copy_config_files(source_dir, profile_dir)
+    if state == "editable":
+        save_codex_config(
+            profile_dir,
+            api_key,
+            provider_name,
+            base_url,
+            model,
+            persist_settings=False,
+        )
+    else:
+        save_custom_provider_config(
+            profile_dir,
+            api_key,
+            provider_name,
+            base_url,
+            model,
+            persist_settings=False,
+        )
+
+
 def build_requested_signature(
     config_dir: Path,
     api_key: str,
@@ -1410,7 +1501,7 @@ def save_config_profile(
     snapshot = capture_config_files(config_dir)
     try:
         if state == "needs_template":
-            create_custom_template_config(config_dir, api_key, provider_name, base_url, model)
+            save_custom_provider_config(config_dir, api_key, provider_name, base_url, model)
         else:
             save_codex_config(config_dir, api_key, provider_name, base_url, model)
         record = create_named_backup(config_dir, config_name)

@@ -249,6 +249,102 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(before, app.capture_config_files(self.config_dir))
         self.assertEqual("Saved Provider", app.read_codex_config(created.path).provider)
 
+    def test_new_profile_preserves_identity_and_unmanaged_fields(self) -> None:
+        self.write_config(
+            self.config_dir,
+            "Current",
+            extra_config='[session]\nconversation_id = "keep-this"',
+            extra_auth={"tokens": {"access_token": "keep-token"}, "account_id": "account-1"},
+        )
+        before = app.capture_config_files(self.config_dir)
+
+        created = app.create_config_profile(
+            self.config_dir,
+            "Preserved profile",
+            "new-key",
+            "New Provider",
+            "https://new.example.com/v1",
+            "gpt-5.6-sol",
+        )
+
+        self.assertEqual(before, app.capture_config_files(self.config_dir))
+        profile_auth = json.loads((created.path / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual({"access_token": "keep-token"}, profile_auth["tokens"])
+        self.assertEqual("account-1", profile_auth["account_id"])
+        profile_config = (created.path / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('conversation_id = "keep-this"', profile_config)
+        self.assertEqual("new-key", app.read_codex_config(created.path).api_key)
+        self.assertEqual("New Provider", app.read_codex_config(created.path).provider)
+
+    def test_new_profile_and_apply_preserves_identity_and_unmanaged_fields(self) -> None:
+        self.write_config(
+            self.config_dir,
+            "Current",
+            extra_config='[session]\nconversation_id = "keep-this"',
+            extra_auth={"tokens": {"access_token": "keep-token"}, "account_id": "account-1"},
+        )
+
+        created = app.create_config_profile(
+            self.config_dir,
+            "Active profile",
+            "active-key",
+            "Active Provider",
+            "https://active.example.com/v1",
+            "gpt-5.6-sol",
+            apply_to_current=True,
+        )
+
+        current_auth = json.loads((self.config_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual({"access_token": "keep-token"}, current_auth["tokens"])
+        self.assertEqual("account-1", current_auth["account_id"])
+        current_config = (self.config_dir / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('conversation_id = "keep-this"', current_config)
+        self.assertEqual("active-key", app.read_codex_config(self.config_dir).api_key)
+        self.assertEqual("Active Provider", app.read_codex_config(self.config_dir).provider)
+        self.assertEqual(
+            app.capture_config_files(created.path),
+            app.capture_config_files(self.config_dir),
+        )
+
+    def test_template_state_save_preserves_existing_files(self) -> None:
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        (self.config_dir / "auth.json").write_text(
+            json.dumps(
+                {
+                    "OPENAI_API_KEY": "old-key",
+                    "tokens": {"access_token": "keep-token"},
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.config_dir / "config.toml").write_text(
+            'model_provider = "openai"\n'
+            'model = "gpt-5.4"\n\n'
+            '[session]\n'
+            'conversation_id = "keep-this"\n',
+            encoding="utf-8",
+        )
+
+        result = app.save_config_profile(
+            self.config_dir,
+            "new-key",
+            "New Provider",
+            "https://new.example.com/v1",
+            "gpt-5.6-sol",
+            "needs_template",
+            "Template-preserved",
+        )
+
+        self.assertEqual("created", result.status)
+        current_auth = json.loads((self.config_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual({"access_token": "keep-token"}, current_auth["tokens"])
+        current_config = (self.config_dir / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('conversation_id = "keep-this"', current_config)
+        self.assertEqual("New Provider", app.read_codex_config(self.config_dir).provider)
+        self.assertEqual("gpt-5.6-sol", app.read_codex_config(self.config_dir).model)
+
     def test_create_profile_and_apply_switches_current_config(self) -> None:
         self.write_config(self.config_dir, "Current")
 
