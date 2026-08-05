@@ -115,3 +115,7 @@ version_info.txt
 保持配置解析、Provider ID、官方登录流程和 Codex 桌面状态保护不变。涉及配置文件写入时，必须先在临时目录验证；完成后同步更新 README、HANDOFF、CHANGELOG 和版本号，并运行完整测试。
 
 已明确不做：引入正式 TOML 解析器、拆分主程序、外部并发检测、扫描路径重构、GUI 自动化测试和合并两套构建脚本。除非需求重新确认，不要把这些项目作为顺手重构加入。
+
+## Developer test helper
+
+`reset_onboarding.bat` is provided for repeatable onboarding testing. Run it from the project root after choosing "Do not show again" in the application. It updates `%APPDATA%\CodexConfigTool\settings.json` by removing only `hide_onboarding`; it must not delete or replace the entire settings file, and it does not modify the Codex configuration directory or official login files. Restart the application after the script completes to show the onboarding prompt again.

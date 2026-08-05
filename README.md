@@ -112,3 +112,7 @@ eye_*_smooth.png       API Key 眼睛图标
 - 作者：k.x
 - 邮箱：1099530893@qq.com
 - 项目：https://github.com/z1099530893/Codex_ConfigTool
+
+### Reset the onboarding prompt
+
+If the onboarding dialog was disabled with "Do not show again", run `reset_onboarding.bat` from the project root. The script removes only the `hide_onboarding` key from `%APPDATA%\CodexConfigTool\settings.json` and preserves all other tool settings. Close and restart Codex Config Tool after running it; the onboarding question will be shown again.
