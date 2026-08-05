@@ -113,6 +113,6 @@ eye_*_smooth.png       API Key 眼睛图标
 - 邮箱：1099530893@qq.com
 - 项目：https://github.com/z1099530893/Codex_ConfigTool
 
-### Reset the onboarding prompt
+### 重置“新手引导”弹窗提示
 
-If the onboarding dialog was disabled with "Do not show again", run `reset_onboarding.bat` from the project root. The script removes only the `hide_onboarding` key from `%APPDATA%\CodexConfigTool\settings.json` and preserves all other tool settings. Close and restart Codex Config Tool after running it; the onboarding question will be shown again.
+“新手引导”弹窗一旦被禁用就不再弹出，为了方便开发测试，开发者可以运行 `reset_onboarding.bat` 脚本，该脚本可以重置这个弹窗，并且可以放在任意目录运行，脚本只开启弹窗，其余所有工具设置将被保留。运行后关闭并重新启动 Codex Config Tool，即可再次显示“新手引导”。
