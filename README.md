@@ -18,15 +18,54 @@ Codex 配置助手 `1.2.0` 是一个 Windows 桌面工具，用于管理和切�
 - 配置签名和搜索信息按文件状态缓存，配置变化后自动失效
 - 固定 `820 × 500` 窗口、扁平化界面、深色自定义标题栏和 Windows 任务栏动画
 
-## 界面
+## 界面预览
 
-左侧导航包含“当前配置”“切换配置”“官方登录”和“新手引导”。
+### 首次启动
 
-“当前配置”页面显示当前配置名称、API Key、Provider 显示名称、Base URL 和 Model，并提供配置目录浏览与新增配置入口。API Key 默认隐藏，使用眼睛图标切换显示。
+启动时可以直接进入软件、打开新手引导，或选择以后不再显示提示。
 
-“切换配置”页面显示配置名称和 Base URL。当前配置使用绿色圆点标记；双击行的空白区域或点击切换按钮即可切换，名称和 Base URL 文本本身不会触发切换。列表滚动条为浅色扁平样式，选中时只改变对应行背景。进入多选后，右键菜单只允许删除所选配置和退出多选。
+<p align="center">
+  <img src="docs/images/onboarding-prompt.png" alt="首次启动的新手引导提示" width="502">
+</p>
 
-“官方登录”会在确认后删除当前目录中的 `auth.json` 和 `config.toml`，保留聊天记录、数据库、日志和配置库，然后由 Codex 在下次启动时完成官方登录。
+### 当前配置
+
+“当前配置”页面只读展示正在使用的配置名称、API Key、Provider 显示名称、Base URL 和 Model。API Key 默认隐藏，可以使用输入框中的眼睛图标切换显示。页面上方可以浏览 Codex 配置目录，也可以基于当前配置新增配置。
+
+![当前配置页面](docs/images/current-config.png)
+
+### 切换配置
+
+“切换配置”页面按配置名称和 Base URL 展示配置库。绿色圆点表示当前配置；可以搜索、排序、编辑、删除或切换配置，并支持右键菜单、全选、`Ctrl+A` 和鼠标左键拖选。
+
+![已保存配置页面](docs/images/saved-configurations.png)
+
+### 官方登录
+
+“官方登录”用于恢复 Codex 官方登录模式。确认后只删除当前目录中的 `auth.json` 和 `config.toml`，聊天记录、本地数据库、日志和配置库都会保留。
+
+![官方登录页面](docs/images/official-login.png)
+
+### 新手引导
+
+新手引导分别说明“新增配置”和“切换配置”两个核心流程，左侧导航可以随时重新打开。
+
+![新手引导页面](docs/images/onboarding-guide.png)
+
+### 关于软件与赞赏作者
+
+右上角的关于按钮可以查看版本、作者、联系方式和项目地址；点击左下角赞赏码可以查看大图。
+
+<table>
+  <tr>
+    <td align="center"><strong>关于软件</strong></td>
+    <td align="center"><strong>赞赏作者</strong></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/about-dialog.png" alt="关于软件窗口" width="400"></td>
+    <td><img src="docs/images/donation-dialog.png" alt="赞赏作者窗口" width="400"></td>
+  </tr>
+</table>
 
 ## 配置库
 
@@ -100,6 +139,7 @@ tests/                 标准库测试
 assets/               图片、图标和赞赏码
 scripts/              构建脚本和测试补丁脚本
 docs/                 项目说明、交接文档和变更记录
+docs/images/          README 使用的界面截图
 CodexConfigTool.spec   PyInstaller 配置
 version_info.txt       Windows EXE 版本资源
 ```
