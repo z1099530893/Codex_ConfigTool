@@ -573,6 +573,16 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(("b", "c", "d", "e"), app.drag_selection_items(items, "b", "d", ("e",)))
         self.assertEqual(("a", "b", "c", "d"), app.drag_selection_items(items, "d", "b", ("a",)))
 
+    def test_key_drag_scroll_accelerates_outside_both_entry_edges(self) -> None:
+        self.assertEqual(0, app.horizontal_drag_scroll_units(0, 400))
+        self.assertEqual(0, app.horizontal_drag_scroll_units(399, 400))
+        self.assertEqual(-2, app.horizontal_drag_scroll_units(-1, 400))
+        self.assertEqual(2, app.horizontal_drag_scroll_units(400, 400))
+        self.assertLess(app.horizontal_drag_scroll_units(-80, 400), -2)
+        self.assertGreater(app.horizontal_drag_scroll_units(480, 400), 2)
+        self.assertEqual(-16, app.horizontal_drag_scroll_units(-1000, 400))
+        self.assertEqual(16, app.horizontal_drag_scroll_units(1400, 400))
+
     def test_onboarding_is_automatic_until_explicitly_disabled(self) -> None:
         self.assertTrue(app.should_show_onboarding({}))
         self.assertTrue(app.should_show_onboarding({app.ONBOARDING_SHOWN_KEY: False}))

@@ -53,6 +53,21 @@ ERROR_ALREADY_EXISTS = 183
 PROFILE_CACHE_LIMIT = 512
 
 
+def horizontal_drag_scroll_units(pointer_x: int, entry_width: int) -> int:
+    """Return accelerated horizontal scroll units when dragging beyond an entry."""
+    if entry_width <= 0:
+        return 0
+    if pointer_x < 0:
+        distance = -pointer_x
+        direction = -1
+    elif pointer_x >= entry_width:
+        distance = pointer_x - entry_width + 1
+        direction = 1
+    else:
+        return 0
+    return direction * min(16, 2 + distance // 8)
+
+
 def resource_path(name: str) -> Path:
     base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base_dir / "assets" / name
@@ -1688,6 +1703,58 @@ class CodexConfigApp(tk.Tk):
             foreground=[("selected", "#1d332c")],
         )
 
+    def _enable_fast_key_navigation(self, entry: ttk.Entry) -> None:
+        drag = {"anchor": 0, "x": 0, "job": None}
+
+        def stop_auto_scroll(_event=None) -> None:
+            job = drag["job"]
+            if job is not None:
+                try:
+                    entry.after_cancel(job)
+                except tk.TclError:
+                    pass
+                drag["job"] = None
+
+        def auto_scroll() -> None:
+            drag["job"] = None
+            if not entry.winfo_exists():
+                return
+            units = horizontal_drag_scroll_units(int(drag["x"]), entry.winfo_width())
+            if not units:
+                return
+            entry.xview_scroll(units, "units")
+            edge_x = 1 if units < 0 else max(entry.winfo_width() - 2, 1)
+            index = entry.index(f"@{edge_x}")
+            anchor = int(drag["anchor"])
+            entry.selection_range(min(anchor, index), max(anchor, index))
+            entry.icursor(index)
+            drag["job"] = entry.after(24, auto_scroll)
+
+        def start_drag(event) -> None:
+            stop_auto_scroll()
+            drag["anchor"] = entry.index(f"@{event.x}")
+            drag["x"] = event.x
+
+        def update_drag(event) -> None:
+            drag["x"] = event.x
+            units = horizontal_drag_scroll_units(event.x, entry.winfo_width())
+            if units and drag["job"] is None:
+                drag["job"] = entry.after(24, auto_scroll)
+            elif not units:
+                stop_auto_scroll()
+
+        def shift_mousewheel(event) -> str:
+            delta_steps = max(abs(event.delta) // 120, 1)
+            direction = -1 if event.delta > 0 else 1
+            entry.xview_scroll(direction * delta_steps * 8, "units")
+            return "break"
+
+        entry.bind("<ButtonPress-1>", start_drag, add="+")
+        entry.bind("<B1-Motion>", update_drag, add="+")
+        entry.bind("<ButtonRelease-1>", stop_auto_scroll, add="+")
+        entry.bind("<Shift-MouseWheel>", shift_mousewheel, add="+")
+        entry.bind("<Destroy>", stop_auto_scroll, add="+")
+
     def _build_ui(self) -> None:
         shell = tk.Frame(self, bg="#f3f4f7", width=WINDOW_WIDTH, height=WINDOW_HEIGHT)
         shell.pack(fill="both", expand=True)
@@ -1926,6 +1993,7 @@ class CodexConfigApp(tk.Tk):
         entry = ttk.Entry(field, textvariable=variable, state="readonly", show="*" if secret else "", style="Readonly.TEntry")
         entry.pack(side="left", fill="both", expand=True, ipady=1)
         if secret:
+            self._enable_fast_key_navigation(entry)
             self.key_toggle_button = self._eye_button(field, self.toggle_key_visibility, "#f7f8f9")
             self.key_toggle_button.place(relx=1.0, rely=0.5, anchor="e", x=-2, y=0)
         return entry
@@ -2492,7 +2560,8 @@ class CodexConfigApp(tk.Tk):
             return entry
 
         name_entry = add_row(2, "配置名称", name_var)
-        add_row(3, "API Key", api_key_var, secret=True)
+        api_key_entry = add_row(3, "API Key", api_key_var, secret=True)
+        self._enable_fast_key_navigation(api_key_entry)
         add_row(4, "Provider 显示名称", provider_var)
         add_row(5, "Base URL", base_url_var)
         add_row(6, "Model", model_var)
