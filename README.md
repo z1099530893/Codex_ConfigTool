@@ -1,11 +1,16 @@
 # Codex 配置助手
 
-Codex 配置助手 `1.2.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库、Tkinter 和 PyInstaller，不联网，也不会上传 API Key。
+Codex 配置助手 `1.3.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库、Tkinter 和 PyInstaller，不联网，也不会上传 API Key。
+
+## 下载
+
+前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版 `CodexConfigTool-v1.3.0.exe`。程序为单文件版本，无需安装。
 
 ## 功能
 
 - 自动识别、手动选择 Codex 配置目录
 - 读取和编辑 API Key、Provider 显示名称、Base URL 和 Model
+- 长 API Key 支持平滑滚轮浏览、键盘定位和越界拖选
 - API Key 等配置文件绝不上传，保护隐私
 - 新增配置并保存到配置库
 - 在配置库中搜索、排序、切换、完整编辑、删除配置
@@ -15,6 +20,7 @@ Codex 配置助手 `1.2.0` 是一个 Windows 桌面工具，用于管理和切�
 - 配置永久保留，不设数量上限，不会自动删除或更新时间
 - 当前配置只读展示，切换配置不弹出保存或确认窗口
 - 官方登录模式和启动新手引导询问
+- 左侧一键重启 Codex，并在执行前进行确认
 - Windows 单实例限制，避免多个窗口交叉修改配置
 - 配置与设置采用原子写入，双文件保存失败时自动恢复原内容
 - 配置签名和搜索信息按文件状态缓存，配置变化后自动失效
@@ -47,6 +53,12 @@ Codex 配置助手 `1.2.0` 是一个 Windows 桌面工具，用于管理和切�
 “官方登录”用于恢复 Codex 官方登录模式。确认后只删除当前目录中的 `auth.json` 和 `config.toml`，聊天记录、本地数据库、日志和配置库都会保留。
 
 ![官方登录页面](docs/images/official-login.png)
+
+### 一键重启 Codex
+
+左侧“一键重启”可以在配置调整完成后直接重新启动 Codex，无需手动查找和结束进程。点击后会先显示确认窗口；选择“是”时，工具只处理 Codex 桌面应用，并优先请求 Codex 正常关闭，等待其保存“跟随系统”等界面设置后再重新启动。只有 Codex 长时间无响应时才会强制结束进程。
+
+![一键重启 Codex 确认窗口](docs/images/one-click-restart.png)
 
 ### 新手引导
 

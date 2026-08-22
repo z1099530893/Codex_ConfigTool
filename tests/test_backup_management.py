@@ -39,6 +39,49 @@ class BackupManagementTests(unittest.TestCase):
         self.assertIsNotNone(second)
         app.release_single_instance(second)
 
+    def test_codex_restart_target_uses_packaged_root_process(self) -> None:
+        package_root = Path(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.814.5517.0_x64__2p2nqsd0c76g0\app"
+        )
+        processes = [
+            app.ProcessRecord(100, 50, package_root / "ChatGPT.exe"),
+            app.ProcessRecord(101, 100, package_root / "ChatGPT.exe"),
+            app.ProcessRecord(102, 100, package_root / "resources" / "codex.exe"),
+        ]
+
+        target = app.codex_restart_target(processes)
+
+        self.assertIsNotNone(target)
+        self.assertEqual(100, target.root_pid)
+        self.assertEqual("OpenAI.Codex_2p2nqsd0c76g0!App", target.app_user_model_id)
+
+    def test_codex_restart_target_ignores_unrelated_chatgpt_and_cli(self) -> None:
+        processes = [
+            app.ProcessRecord(100, 50, Path(r"C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0_x64__abc\app\ChatGPT.exe")),
+            app.ProcessRecord(200, 50, Path(r"C:\Tools\codex.exe")),
+        ]
+
+        self.assertIsNone(app.codex_restart_target(processes))
+
+    def test_codex_restart_target_supports_regular_desktop_install(self) -> None:
+        executable = Path(r"C:\Users\Tester\AppData\Local\Programs\Codex\Codex.exe")
+
+        target = app.codex_restart_target([app.ProcessRecord(300, 50, executable)])
+
+        self.assertIsNotNone(target)
+        self.assertEqual(executable, target.executable)
+        self.assertIsNone(target.app_user_model_id)
+
+    def test_process_tree_ids_include_nested_codex_children_only(self) -> None:
+        processes = [
+            app.ProcessRecord(100, 50, Path(r"C:\Codex\ChatGPT.exe")),
+            app.ProcessRecord(101, 100, Path(r"C:\Codex\ChatGPT.exe")),
+            app.ProcessRecord(102, 101, Path(r"C:\Codex\resources\codex.exe")),
+            app.ProcessRecord(200, 50, Path(r"C:\Other\ChatGPT.exe")),
+        ]
+
+        self.assertEqual({100, 101, 102}, app.process_tree_ids(processes, 100))
+
     def write_config(
         self,
         config_dir: Path,
@@ -582,6 +625,13 @@ class BackupManagementTests(unittest.TestCase):
         self.assertGreater(app.horizontal_drag_scroll_units(480, 400), 2)
         self.assertEqual(-16, app.horizontal_drag_scroll_units(-1000, 400))
         self.assertEqual(16, app.horizontal_drag_scroll_units(1400, 400))
+
+    def test_key_pixel_scroll_target_is_smooth_and_clamped(self) -> None:
+        self.assertAlmostEqual(0.12, app.horizontal_scroll_target(0.1, 0.3, 400, 40))
+        self.assertEqual(0.0, app.horizontal_scroll_target(0.01, 0.21, 400, -1000))
+        self.assertEqual(0.8, app.horizontal_scroll_target(0.79, 0.99, 400, 1000))
+        self.assertEqual(0.0, app.horizontal_scroll_target(0.0, 1.0, 400, 100))
+        self.assertEqual(0.0, app.horizontal_scroll_target(0.1, 0.3, 0, 100))
 
     def test_onboarding_is_automatic_until_explicitly_disabled(self) -> None:
         self.assertTrue(app.should_show_onboarding({}))

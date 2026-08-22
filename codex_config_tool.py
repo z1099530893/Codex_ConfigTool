@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import webbrowser
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -15,7 +19,7 @@ from tkinter import filedialog, font as tkfont, ttk
 
 
 APP_NAME = "Codex 配置助手"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
@@ -51,6 +55,10 @@ ONBOARDING_SHOWN_KEY = "onboarding_shown"
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\z1099530893.CodexConfigTool"
 ERROR_ALREADY_EXISTS = 183
 PROFILE_CACHE_LIMIT = 512
+CODEX_PACKAGE_PATH_PATTERN = re.compile(
+    r"[\\/]WindowsApps[\\/](?P<identity>OpenAI\.Codex)_[^\\/]+__(?P<publisher>[^\\/]+)[\\/]",
+    re.IGNORECASE,
+)
 
 
 def horizontal_drag_scroll_units(pointer_x: int, entry_width: int) -> int:
@@ -66,6 +74,20 @@ def horizontal_drag_scroll_units(pointer_x: int, entry_width: int) -> int:
     else:
         return 0
     return direction * min(16, 2 + distance // 8)
+
+
+def horizontal_scroll_target(
+    first: float,
+    last: float,
+    viewport_width: int,
+    pixel_delta: float,
+) -> float:
+    """Translate a pixel scroll distance into a clamped Entry xview position."""
+    span = max(last - first, 0.0)
+    if viewport_width <= 0 or span <= 0.0 or span >= 1.0:
+        return 0.0
+    content_width = viewport_width / span
+    return min(max(first + pixel_delta / content_width, 0.0), 1.0 - span)
 
 
 def resource_path(name: str) -> Path:
@@ -115,6 +137,226 @@ def show_already_running_message() -> None:
         APP_NAME,
         0x00000040,
     )
+
+
+class CodexRestartError(RuntimeError):
+    pass
+
+
+def list_windows_processes(executable_names: set[str]) -> list[ProcessRecord]:
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W))
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W))
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    records = []
+    wanted = {name.casefold() for name in executable_names}
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(ProcessEntry32W)
+        has_entry = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+        while has_entry:
+            if entry.szExeFile.casefold() in wanted:
+                process = kernel32.OpenProcess(0x1000, False, entry.th32ProcessID)
+                if process:
+                    try:
+                        capacity = wintypes.DWORD(32768)
+                        buffer = ctypes.create_unicode_buffer(capacity.value)
+                        if kernel32.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(capacity)):
+                            records.append(
+                                ProcessRecord(
+                                    pid=int(entry.th32ProcessID),
+                                    parent_pid=int(entry.th32ParentProcessID),
+                                    executable=Path(buffer.value),
+                                )
+                            )
+                    finally:
+                        kernel32.CloseHandle(process)
+            has_entry = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return records
+
+
+def codex_restart_target(processes: list[ProcessRecord]) -> CodexRestartTarget | None:
+    main_processes = []
+    for process in processes:
+        executable_name = process.executable.name.casefold()
+        executable_text = str(process.executable).casefold().replace("/", "\\")
+        is_codex_install = "openai.codex_" in executable_text or "\\codex\\" in executable_text
+        if executable_name in {"chatgpt.exe", "codex.exe"} and is_codex_install:
+            main_processes.append(process)
+    if not main_processes:
+        return None
+
+    process_ids = {process.pid for process in main_processes}
+    roots = [process for process in main_processes if process.parent_pid not in process_ids]
+    preferred = roots or main_processes
+    preferred.sort(key=lambda process: (process.executable.name.casefold() != "chatgpt.exe", process.pid))
+    root = preferred[0]
+
+    package_match = CODEX_PACKAGE_PATH_PATTERN.search(str(root.executable))
+    app_user_model_id = None
+    if package_match:
+        app_user_model_id = f"{package_match.group('identity')}_{package_match.group('publisher')}!App"
+    return CodexRestartTarget(
+        root_pid=root.pid,
+        executable=root.executable,
+        app_user_model_id=app_user_model_id,
+    )
+
+
+def process_tree_ids(processes: list[ProcessRecord], root_pid: int) -> set[int]:
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for process in processes:
+            if process.parent_pid in descendants and process.pid not in descendants:
+                descendants.add(process.pid)
+                changed = True
+    return descendants
+
+
+def request_windows_close(process_ids: set[int]) -> int:
+    if os.name != "nt" or not process_ids:
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    user32.PostMessageW.restype = wintypes.BOOL
+
+    closed = 0
+
+    @callback_type
+    def close_window(hwnd, _lparam):
+        nonlocal closed
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if int(process_id.value) in process_ids and user32.PostMessageW(hwnd, 0x0010, 0, 0):
+            closed += 1
+        return True
+
+    user32.EnumWindows(close_window, 0)
+    return closed
+
+
+def process_is_running(process_id: int) -> bool:
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    process = kernel32.OpenProcess(0x00100000, False, process_id)
+    if not process:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(process, 0) == 0x00000102
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def wait_for_processes_exit(process_ids: set[int], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(process_is_running(process_id) for process_id in process_ids):
+            return True
+        time.sleep(0.1)
+    return not any(process_is_running(process_id) for process_id in process_ids)
+
+
+def restart_codex_application() -> CodexRestartTarget:
+    if os.name != "nt":
+        raise CodexRestartError("一键重启目前仅支持 Windows。")
+    processes = list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
+    target = codex_restart_target(processes)
+    if target is None:
+        raise CodexRestartError("没有检测到正在运行的 Codex。")
+
+    tree_ids = process_tree_ids(processes, target.root_pid)
+    requested_close = request_windows_close(tree_ids)
+    closed_normally = requested_close > 0 and wait_for_processes_exit(tree_ids, 8.0)
+    if not closed_normally:
+        completed = subprocess.run(
+            ["taskkill", "/PID", str(target.root_pid), "/T", "/F"],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        if completed.returncode != 0 and process_is_running(target.root_pid):
+            raise CodexRestartError("无法关闭当前 Codex 进程。")
+        wait_for_processes_exit(tree_ids, 2.0)
+
+    time.sleep(0.8)
+    try:
+        if target.app_user_model_id:
+            subprocess.Popen(
+                ["explorer.exe", f"shell:AppsFolder\\{target.app_user_model_id}"],
+                close_fds=True,
+            )
+        else:
+            subprocess.Popen(
+                [str(target.executable)],
+                close_fds=True,
+                creationflags=(
+                    getattr(subprocess, "DETACHED_PROCESS", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                ),
+            )
+    except OSError as exc:
+        raise CodexRestartError(f"Codex 已关闭，但重新启动失败：{exc}") from exc
+    return target
 
 
 class Tooltip:
@@ -288,6 +530,20 @@ class BackupRecord:
 class BackupResult:
     status: str
     record: BackupRecord | None = None
+
+
+@dataclass(frozen=True)
+class ProcessRecord:
+    pid: int
+    parent_pid: int
+    executable: Path
+
+
+@dataclass(frozen=True)
+class CodexRestartTarget:
+    root_pid: int
+    executable: Path
+    app_user_model_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1684,6 +1940,15 @@ class CodexConfigApp(tk.Tk):
         style.configure("Danger.TButton", font=("Microsoft YaHei UI", 9), padding=(10, 6), foreground="#a33a32")
         style.configure("TEntry", padding=6, relief="flat", borderwidth=1)
         style.configure("Readonly.TEntry", padding=6, fieldbackground="#f7f8f9", foreground="#343a43")
+        style.configure("Key.TEntry", padding=(6, 6, 36, 6), relief="flat", borderwidth=1)
+        style.configure(
+            "ReadonlyKey.TEntry",
+            padding=(6, 6, 36, 6),
+            relief="flat",
+            borderwidth=1,
+            fieldbackground="#f7f8f9",
+            foreground="#343a43",
+        )
         style.configure("Treeview", rowheight=31, font=("Microsoft YaHei UI", 9), background="#ffffff", fieldbackground="#ffffff", borderwidth=0)
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"), padding=(8, 7), background="#eef0f2", foreground="#343a43")
         style.map("Treeview", background=[("selected", "#dce9e4")], foreground=[("selected", "#1d332c")])
@@ -1704,56 +1969,124 @@ class CodexConfigApp(tk.Tk):
         )
 
     def _enable_fast_key_navigation(self, entry: ttk.Entry) -> None:
-        drag = {"anchor": 0, "x": 0, "job": None}
+        state = {
+            "anchor": 0,
+            "pointer_x": 0,
+            "auto_job": None,
+            "animation_job": None,
+            "animation_target": None,
+        }
 
-        def stop_auto_scroll(_event=None) -> None:
-            job = drag["job"]
+        def cancel_animation() -> None:
+            job = state["animation_job"]
             if job is not None:
                 try:
                     entry.after_cancel(job)
                 except tk.TclError:
                     pass
-                drag["job"] = None
+            state["animation_job"] = None
+            state["animation_target"] = None
+
+        def animate_view() -> None:
+            state["animation_job"] = None
+            if not entry.winfo_exists() or state["animation_target"] is None:
+                return
+            first, _last = entry.xview()
+            target = float(state["animation_target"])
+            distance = target - first
+            if abs(distance) < 0.0004:
+                entry.xview_moveto(target)
+                state["animation_target"] = None
+                return
+            entry.xview_moveto(first + distance * 0.34)
+            state["animation_job"] = entry.after(12, animate_view)
+
+        def scroll_pixels(pixel_delta: float, animated: bool = True) -> None:
+            first, last = entry.xview()
+            viewport_width = max(entry.winfo_width() - 41, 1)
+            base = float(state["animation_target"]) if state["animation_target"] is not None else first
+            target = horizontal_scroll_target(base, base + (last - first), viewport_width, pixel_delta)
+            if animated:
+                state["animation_target"] = target
+                if state["animation_job"] is None:
+                    state["animation_job"] = entry.after(1, animate_view)
+            else:
+                cancel_animation()
+                entry.xview_moveto(target)
+
+        def stop_auto_scroll(_event=None) -> None:
+            job = state["auto_job"]
+            if job is not None:
+                try:
+                    entry.after_cancel(job)
+                except tk.TclError:
+                    pass
+                state["auto_job"] = None
 
         def auto_scroll() -> None:
-            drag["job"] = None
+            state["auto_job"] = None
             if not entry.winfo_exists():
                 return
-            units = horizontal_drag_scroll_units(int(drag["x"]), entry.winfo_width())
+            units = horizontal_drag_scroll_units(int(state["pointer_x"]), entry.winfo_width())
             if not units:
                 return
-            entry.xview_scroll(units, "units")
+            scroll_pixels(units * 3.0, animated=False)
             edge_x = 1 if units < 0 else max(entry.winfo_width() - 2, 1)
             index = entry.index(f"@{edge_x}")
-            anchor = int(drag["anchor"])
+            anchor = int(state["anchor"])
             entry.selection_range(min(anchor, index), max(anchor, index))
             entry.icursor(index)
-            drag["job"] = entry.after(24, auto_scroll)
+            state["auto_job"] = entry.after(16, auto_scroll)
 
         def start_drag(event) -> None:
             stop_auto_scroll()
-            drag["anchor"] = entry.index(f"@{event.x}")
-            drag["x"] = event.x
+            cancel_animation()
+            state["anchor"] = entry.index(f"@{event.x}")
+            state["pointer_x"] = event.x
 
-        def update_drag(event) -> None:
-            drag["x"] = event.x
+        def update_drag(event) -> str | None:
+            state["pointer_x"] = event.x
             units = horizontal_drag_scroll_units(event.x, entry.winfo_width())
-            if units and drag["job"] is None:
-                drag["job"] = entry.after(24, auto_scroll)
-            elif not units:
-                stop_auto_scroll()
+            if units:
+                if state["auto_job"] is None:
+                    state["auto_job"] = entry.after(16, auto_scroll)
+                return "break"
+            stop_auto_scroll()
+            return None
 
-        def shift_mousewheel(event) -> str:
-            delta_steps = max(abs(event.delta) // 120, 1)
-            direction = -1 if event.delta > 0 else 1
-            entry.xview_scroll(direction * delta_steps * 8, "units")
+        def mousewheel(event) -> str:
+            delta_steps = event.delta / 120 if event.delta else 0
+            if delta_steps:
+                scroll_pixels(-delta_steps * 72.0)
             return "break"
+
+        def smooth_keyboard_view(_event=None) -> None:
+            before = entry.xview()
+
+            def follow_default_binding() -> None:
+                if not entry.winfo_exists():
+                    return
+                after = entry.xview()
+                if abs(after[0] - before[0]) < 0.0004:
+                    return
+                cancel_animation()
+                entry.xview_moveto(before[0])
+                state["animation_target"] = after[0]
+                state["animation_job"] = entry.after(1, animate_view)
+
+            entry.after_idle(follow_default_binding)
+
+        def destroy_navigation(_event=None) -> None:
+            stop_auto_scroll()
+            cancel_animation()
 
         entry.bind("<ButtonPress-1>", start_drag, add="+")
         entry.bind("<B1-Motion>", update_drag, add="+")
         entry.bind("<ButtonRelease-1>", stop_auto_scroll, add="+")
-        entry.bind("<Shift-MouseWheel>", shift_mousewheel, add="+")
-        entry.bind("<Destroy>", stop_auto_scroll, add="+")
+        entry.bind("<MouseWheel>", mousewheel, add="+")
+        entry.bind("<Shift-MouseWheel>", mousewheel, add="+")
+        entry.bind("<KeyPress>", smooth_keyboard_view, add="+")
+        entry.bind("<Destroy>", destroy_navigation, add="+")
 
     def _build_ui(self) -> None:
         shell = tk.Frame(self, bg="#f3f4f7", width=WINDOW_WIDTH, height=WINDOW_HEIGHT)
@@ -1801,9 +2134,10 @@ class CodexConfigApp(tk.Tk):
             ("current", "当前配置"),
             ("profiles", "切换配置"),
             ("official", "官方登录"),
-            ("guide", "新手引导"),
         ):
             self._create_nav_item(nav, key, text)
+        self.restart_codex_button = self._create_action_nav_item(nav, "一键重启", self.restart_codex)
+        self._create_nav_item(nav, "guide", "新手引导")
 
         if self.donation_thumbnail is not None:
             donation_button = tk.Button(
@@ -1911,6 +2245,31 @@ class CodexConfigApp(tk.Tk):
         button.pack(side="left", fill="both", expand=True)
         self.nav_items[key] = (row, indicator, button)
 
+    def _create_action_nav_item(self, parent: tk.Misc, text: str, command) -> tk.Button:
+        row = tk.Frame(parent, bg="#5b5b5b", height=42)
+        row.pack(fill="x")
+        row.pack_propagate(False)
+        tk.Label(row, bg="#5b5b5b", width=1).pack(side="left", fill="y")
+        button = tk.Button(
+            row,
+            text=text,
+            command=command,
+            bg="#5b5b5b",
+            fg="#ffffff",
+            activebackground="#6a6a6a",
+            activeforeground="#ffffff",
+            disabledforeground="#b9bdc1",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            anchor="w",
+            padx=24,
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        )
+        button.pack(side="left", fill="both", expand=True)
+        return button
+
     def show_page(self, key: str) -> None:
         page = self.pages.get(key)
         if page is None:
@@ -1928,6 +2287,29 @@ class CodexConfigApp(tk.Tk):
             self.refresh_profiles()
         elif key == "official":
             self._refresh_official_page()
+
+    def restart_codex(self) -> None:
+        if not self.ask_yes_no("是否确认重启 Codex？"):
+            return
+        self.restart_codex_button.configure(state="disabled", cursor="arrow")
+        self._notify("正在重启 Codex...")
+
+        def worker() -> None:
+            try:
+                restart_codex_application()
+            except (CodexRestartError, OSError) as exc:
+                self.after(0, lambda: self._finish_codex_restart(str(exc)))
+                return
+            self.after(0, lambda: self._finish_codex_restart(None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_codex_restart(self, error: str | None) -> None:
+        self.restart_codex_button.configure(state="normal", cursor="hand2")
+        if error:
+            self.show_error(f"重启 Codex 失败：\n{error}")
+            return
+        self._notify("Codex 已重新启动。")
 
     def _new_page(self, key: str) -> tk.Frame:
         page = tk.Frame(self.page_host, bg="#f3f4f7")
@@ -1990,12 +2372,18 @@ class CodexConfigApp(tk.Tk):
         tk.Label(parent, text=label, bg="#ffffff", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=6)
         field = tk.Frame(parent, bg="#ffffff")
         field.grid(row=row, column=1, sticky="ew", pady=6)
-        entry = ttk.Entry(field, textvariable=variable, state="readonly", show="*" if secret else "", style="Readonly.TEntry")
+        entry = ttk.Entry(
+            field,
+            textvariable=variable,
+            state="readonly",
+            show="*" if secret else "",
+            style="ReadonlyKey.TEntry" if secret else "Readonly.TEntry",
+        )
         entry.pack(side="left", fill="both", expand=True, ipady=1)
         if secret:
             self._enable_fast_key_navigation(entry)
             self.key_toggle_button = self._eye_button(field, self.toggle_key_visibility, "#f7f8f9")
-            self.key_toggle_button.place(relx=1.0, rely=0.5, anchor="e", x=-2, y=0)
+            self.key_toggle_button.place(relx=1.0, rely=0.5, anchor="e", x=-6, y=0)
         return entry
 
     def _build_official_page(self) -> None:
@@ -2544,11 +2932,17 @@ class CodexConfigApp(tk.Tk):
             tk.Label(container, text=label, bg="#f3f4f7", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=6)
             field = tk.Frame(container, bg="#f3f4f7")
             field.grid(row=row, column=1, columnspan=2, sticky="ew", pady=6)
-            entry = ttk.Entry(field, textvariable=variable, show="*" if secret else "", width=48)
+            entry = ttk.Entry(
+                field,
+                textvariable=variable,
+                show="*" if secret else "",
+                width=48,
+                style="Key.TEntry" if secret else "TEntry",
+            )
             entry.pack(fill="both", expand=True, ipady=1)
             if secret:
                 eye_button = self._eye_button(field, lambda: None, "#ffffff")
-                eye_button.place(relx=1.0, rely=0.5, anchor="e", x=-2, y=0)
+                eye_button.place(relx=1.0, rely=0.5, anchor="e", x=-6, y=0)
 
                 def toggle() -> None:
                     visible = not editor_show_key.get()

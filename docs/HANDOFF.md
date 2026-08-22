@@ -2,7 +2,7 @@
 
 ## 当前版本
 
-- 版本：`1.2.0`
+- 版本：`1.3.0`
 - 平台：Windows
 - 技术栈：Python 标准库、Tkinter、PyInstaller
 - 主程序：`codex_config_tool.py`
@@ -47,6 +47,7 @@
 - `build_backup_signature` / `build_requested_signature`：生成配置核心签名
 - `cached_profile_entry` / `clear_profile_cache`：配置签名和列表搜索缓存
 - `atomic_write_bytes` / `atomic_copy_file`：同目录原子写入和复制
+- `restart_codex_application`：识别 Codex 主进程并按安装类型重新启动
 - `find_matching_backup`：查找内容相同的配置库项目
 - `create_named_backup` / `restore_backup`：创建和切换配置库项目
 - `save_config_profile` / `update_config_profile`：保存新增配置和编辑配置
@@ -61,7 +62,7 @@
 - 自定义深色标题栏提供关于、最小化、关闭和窗口拖动
 - 主窗口通过保留 `WS_CAPTION` 并拦截 `WM_NCCALCSIZE` 获得 Windows 任务栏动画；`_native_wndproc` 必须由实例持续持有，不能改成局部临时回调
 - 主窗口任务栏只使用 `app_icon_title.png`；弹窗和 EXE 使用 `app_icon.ico`，不要用 `iconphoto(True, ...)` 覆盖全部弹窗
-- 左侧页面顺序为当前配置、切换配置、官方登录、新手引导
+- 左侧功能顺序为当前配置、切换配置、官方登录、一键重启、新手引导
 - 当前页面只读；配置编辑统一从新增配置或切换配置页面进入
 - 配置列表外围始终为浅灰细边框，选中只改变对应行背景
 - 次要按钮使用统一浅灰背景，绿色按钮表示主要操作
@@ -73,6 +74,12 @@
 ## 单实例和退出
 
 `main()` 在创建 Tk 窗口前获取 `Local\\z1099530893.CodexConfigTool` 互斥量。重复启动只显示提示，不读取或写入配置。关闭主窗口后 Tk 主循环退出，`finally` 释放互斥量；扫描线程使用 daemon，不阻止程序结束。
+
+## 一键重启 Codex
+
+`restart_codex_application()` 只识别 Codex 桌面应用，不应匹配普通 ChatGPT、命令行 Codex 或本工具自身。Windows Store 版本通过 `OpenAI.Codex` 包和窗口所属进程识别，普通安装版本通过可执行文件路径识别。
+
+重启时先向 Codex 顶层窗口发送 `WM_CLOSE`，最多等待 8 秒，让 Codex 保存“跟随系统”等界面状态；只有进程仍未退出时才使用 `taskkill /F`。随后按原安装类型启动：Store 版本使用 AppsFolder AUMID，普通版本直接启动原可执行文件。修改该流程时不得退回默认强制结束，否则可能造成显示设置回退。
 
 ## 资源和打包
 
@@ -108,7 +115,9 @@ version_info.txt
 7. 验证超过 5 个配置仍全部保留
 8. 验证列表选择、拖选、全选、滚动条和弹窗按钮的 Windows 界面效果
 9. 连续验证任务栏最小化/恢复动画，确认没有第二条系统标题栏
-10. 关闭程序后确认进程结束，再进行 PyInstaller 打包，并检查 EXE 详细信息中的 `1.2.0` 版本
+10. 验证一键重启只处理 Codex 桌面应用，确认窗口取消时不执行任何操作
+11. 验证正常关闭路径会保留 Codex 的“跟随系统”显示模式，并验证超时回退和 Store 版重新启动路径
+12. 关闭程序后确认进程结束，再进行 PyInstaller 打包，并检查 EXE 详细信息中的 `1.3.0` 版本
 
 ## 后续修改原则
 
