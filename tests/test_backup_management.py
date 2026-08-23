@@ -72,6 +72,55 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(executable, target.executable)
         self.assertIsNone(target.app_user_model_id)
 
+    @unittest.skipUnless(os.name == "nt", "Windows Codex launch test")
+    def test_codex_launch_starts_store_app_when_not_running(self) -> None:
+        target = app.CodexRestartTarget(
+            root_pid=0,
+            executable=Path(),
+            app_user_model_id="OpenAI.Codex_2p2nqsd0c76g0!App",
+        )
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "discover_codex_installation", return_value=target),
+            patch.object(app, "activate_codex_window", return_value=True),
+            patch.object(app.subprocess, "Popen") as popen,
+        ):
+            result = app.restart_codex_application()
+
+        self.assertEqual("start", result.action)
+        popen.assert_called_once_with(
+            ["explorer.exe", "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"],
+            close_fds=True,
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows Codex restart test")
+    def test_codex_restart_waits_for_normal_exit_before_launching(self) -> None:
+        target = app.CodexRestartTarget(root_pid=100, executable=Path(r"C:\Codex\Codex.exe"))
+        processes = [app.ProcessRecord(100, 50, target.executable)]
+        with (
+            patch.object(app, "list_windows_processes", return_value=processes),
+            patch.object(app, "request_windows_close", return_value=1) as request_close,
+            patch.object(app, "wait_for_processes_exit", return_value=True) as wait_exit,
+            patch.object(app, "activate_codex_window", return_value=True),
+            patch.object(app.time, "sleep"),
+            patch.object(app.subprocess, "Popen") as popen,
+            patch.object(app.subprocess, "run") as run,
+        ):
+            result = app.restart_codex_application()
+
+        self.assertEqual("restart", result.action)
+        request_close.assert_called_once_with({100})
+        wait_exit.assert_called_once_with({100}, 8.0)
+        run.assert_not_called()
+        popen.assert_called_once_with(
+            [str(target.executable)],
+            close_fds=True,
+            creationflags=(
+                getattr(app.subprocess, "DETACHED_PROCESS", 0)
+                | getattr(app.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            ),
+        )
+
     def test_process_tree_ids_include_nested_codex_children_only(self) -> None:
         processes = [
             app.ProcessRecord(100, 50, Path(r"C:\Codex\ChatGPT.exe")),

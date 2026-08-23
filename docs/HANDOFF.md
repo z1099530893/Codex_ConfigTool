@@ -47,7 +47,7 @@
 - `build_backup_signature` / `build_requested_signature`：生成配置核心签名
 - `cached_profile_entry` / `clear_profile_cache`：配置签名和列表搜索缓存
 - `atomic_write_bytes` / `atomic_copy_file`：同目录原子写入和复制
-- `restart_codex_application`：识别 Codex 主进程并按安装类型重新启动
+- `restart_codex_application`：识别、启动或重启 Codex，并按安装类型重新启动
 - `find_matching_backup`：查找内容相同的配置库项目
 - `create_named_backup` / `restore_backup`：创建和切换配置库项目
 - `save_config_profile` / `update_config_profile`：保存新增配置和编辑配置
@@ -77,9 +77,9 @@
 
 ## 一键重启 Codex
 
-`restart_codex_application()` 只识别 Codex 桌面应用，不应匹配普通 ChatGPT、命令行 Codex 或本工具自身。Windows Store 版本通过 `OpenAI.Codex` 包和窗口所属进程识别，普通安装版本通过可执行文件路径识别。
+`restart_codex_application()` 只识别 Codex 桌面应用，不应匹配普通 ChatGPT、命令行 Codex 或本工具自身。Windows Store 版本通过 `OpenAI.Codex` 包和窗口所属进程识别，普通安装版本通过可执行文件路径识别。Codex 未运行时，会通过 AppX 包或常见桌面安装路径寻找可启动目标并直接启动。
 
-重启时先向 Codex 顶层窗口发送 `WM_CLOSE`，最多等待 8 秒，让 Codex 保存“跟随系统”等界面状态；只有进程仍未退出时才使用 `taskkill /F`。随后按原安装类型启动：Store 版本使用 AppsFolder AUMID，普通版本直接启动原可执行文件。修改该流程时不得退回默认强制结束，否则可能造成显示设置回退。
+重启时先向 Codex 顶层窗口发送 `WM_CLOSE`，最多等待 8 秒，让 Codex 保存“跟随系统”等界面状态；即使没有枚举到顶层窗口，也会先完成等待，不会立即强制结束。只有进程仍未退出时才使用 `taskkill /F`。随后按原安装类型启动：Store 版本使用 AppsFolder AUMID，普通版本直接启动原可执行文件。正常关闭只能提供保存机会，不能保证 Codex 在超时强制结束前完成所有内存状态写入。修改该流程时不得退回默认强制结束，否则可能造成显示设置回退。
 
 ## 资源和打包
 
@@ -115,9 +115,10 @@ version_info.txt
 7. 验证超过 5 个配置仍全部保留
 8. 验证列表选择、拖选、全选、滚动条和弹窗按钮的 Windows 界面效果
 9. 连续验证任务栏最小化/恢复动画，确认没有第二条系统标题栏
-10. 验证一键重启只处理 Codex 桌面应用，确认窗口取消时不执行任何操作
-11. 验证正常关闭路径会保留 Codex 的“跟随系统”显示模式，并验证超时回退和 Store 版重新启动路径
-12. 关闭程序后确认进程结束，再进行 PyInstaller 打包，并检查 EXE 详细信息中的 `1.3.0` 版本
+10. 验证 Codex 未启动时“一键重启”会改为启动 Codex，未找到安装时显示错误
+11. 验证一键重启只处理 Codex 桌面应用，确认窗口取消时不执行任何操作
+12. 验证正常关闭路径会保留 Codex 的“跟随系统”显示模式，并验证无窗口等待、超时回退和 Store 版重新启动路径
+13. 关闭程序后确认进程结束，再进行 PyInstaller 打包，并检查 EXE 详细信息中的 `1.3.0` 版本
 
 ## 后续修改原则
 

@@ -143,6 +143,12 @@ class CodexRestartError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class CodexLaunchResult:
+    target: CodexRestartTarget
+    action: str
+
+
 def list_windows_processes(executable_names: set[str]) -> list[ProcessRecord]:
     if os.name != "nt":
         return []
@@ -254,6 +260,48 @@ def process_tree_ids(processes: list[ProcessRecord], root_pid: int) -> set[int]:
     return descendants
 
 
+def discover_codex_installation() -> CodexRestartTarget | None:
+    """Find a launchable Codex installation when no Codex process is running."""
+    if os.name != "nt":
+        return None
+
+    try:
+        package = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-AppxPackage -Name 'OpenAI.Codex' | Select-Object -First 1).PackageFamilyName",
+            ],
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        ).stdout.strip()
+    except OSError:
+        package = ""
+    if package.casefold().startswith("openai.codex_"):
+        return CodexRestartTarget(
+            root_pid=0,
+            executable=Path(),
+            app_user_model_id=f"{package}!App",
+        )
+
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
+    program_files = Path(os.environ.get("PROGRAMFILES", ""))
+    candidates = (
+        local_app_data / "Programs" / "Codex" / "Codex.exe",
+        local_app_data / "Programs" / "OpenAI" / "Codex" / "Codex.exe",
+        program_files / "Codex" / "Codex.exe",
+        program_files / "OpenAI" / "Codex" / "Codex.exe",
+    )
+    for executable in candidates:
+        if executable.is_file():
+            return CodexRestartTarget(root_pid=0, executable=executable)
+    return None
+
+
 def request_windows_close(process_ids: set[int]) -> int:
     if os.name != "nt" or not process_ids:
         return 0
@@ -316,29 +364,96 @@ def wait_for_processes_exit(process_ids: set[int], timeout: float) -> bool:
     return not any(process_is_running(process_id) for process_id in process_ids)
 
 
-def restart_codex_application() -> CodexRestartTarget:
+def activate_codex_window(target: CodexRestartTarget, timeout: float = 12.0) -> bool:
+    """Wait for the launched Codex window and bring it back to the foreground."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+
+    def process_ids() -> set[int]:
+        records = list_windows_processes({"ChatGPT.exe", "codex.exe"})
+        if target.app_user_model_id:
+            return {
+                record.pid
+                for record in records
+                if "openai.codex_" in str(record.executable).casefold().replace("/", "\\")
+            }
+        return {
+            record.pid
+            for record in records
+            if str(record.executable).casefold() == str(target.executable).casefold()
+        }
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        candidate_ids = process_ids()
+        found = {"handle": 0}
+
+        @callback_type
+        def find_window(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            if int(process_id.value) in candidate_ids:
+                found["handle"] = hwnd
+                return False
+            return True
+
+        user32.EnumWindows(find_window, 0)
+        if found["handle"]:
+            user32.ShowWindow(found["handle"], 9)  # SW_RESTORE
+            user32.SetForegroundWindow(found["handle"])
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def restart_codex_application() -> CodexLaunchResult:
     if os.name != "nt":
         raise CodexRestartError("一键重启目前仅支持 Windows。")
     processes = list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
     target = codex_restart_target(processes)
+    action = "restart"
     if target is None:
-        raise CodexRestartError("没有检测到正在运行的 Codex。")
+        target = discover_codex_installation()
+        if target is None:
+            raise CodexRestartError("没有检测到 Codex 安装，也没有正在运行的 Codex。")
+        action = "start"
 
-    tree_ids = process_tree_ids(processes, target.root_pid)
-    requested_close = request_windows_close(tree_ids)
-    closed_normally = requested_close > 0 and wait_for_processes_exit(tree_ids, 8.0)
-    if not closed_normally:
-        completed = subprocess.run(
-            ["taskkill", "/PID", str(target.root_pid), "/T", "/F"],
-            capture_output=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            check=False,
-        )
-        if completed.returncode != 0 and process_is_running(target.root_pid):
-            raise CodexRestartError("无法关闭当前 Codex 进程。")
-        wait_for_processes_exit(tree_ids, 2.0)
+    if action == "restart":
+        tree_ids = process_tree_ids(processes, target.root_pid)
+        request_windows_close(tree_ids)
+        # WM_CLOSE gives Codex a chance to persist its in-memory settings.
+        # Even when no top-level window was enumerated, wait before fallback.
+        closed_normally = wait_for_processes_exit(tree_ids, 8.0)
+        if not closed_normally:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(target.root_pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            if completed.returncode != 0 and process_is_running(target.root_pid):
+                raise CodexRestartError("无法关闭当前 Codex 进程。")
+            wait_for_processes_exit(tree_ids, 2.0)
 
-    time.sleep(0.8)
+    if action == "restart":
+        time.sleep(0.8)
     try:
         if target.app_user_model_id:
             subprocess.Popen(
@@ -356,7 +471,9 @@ def restart_codex_application() -> CodexRestartTarget:
             )
     except OSError as exc:
         raise CodexRestartError(f"Codex 已关闭，但重新启动失败：{exc}") from exc
-    return target
+    if not activate_codex_window(target):
+        raise CodexRestartError("Codex 进程已启动，但主窗口未显示。请在任务栏或开始菜单中手动打开 Codex。")
+    return CodexLaunchResult(target=target, action=action)
 
 
 class Tooltip:
@@ -2289,27 +2406,36 @@ class CodexConfigApp(tk.Tk):
             self._refresh_official_page()
 
     def restart_codex(self) -> None:
-        if not self.ask_yes_no("是否确认重启 Codex？"):
+        running = False
+        if os.name == "nt":
+            try:
+                running = codex_restart_target(
+                    list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
+                ) is not None
+            except OSError:
+                running = False
+        prompt = "是否确认重启 Codex？" if running else "Codex 当前未启动，是否启动 Codex？"
+        if not self.ask_yes_no(prompt):
             return
         self.restart_codex_button.configure(state="disabled", cursor="arrow")
         self._notify("正在重启 Codex...")
 
         def worker() -> None:
             try:
-                restart_codex_application()
+                result = restart_codex_application()
             except (CodexRestartError, OSError) as exc:
                 self.after(0, lambda: self._finish_codex_restart(str(exc)))
                 return
-            self.after(0, lambda: self._finish_codex_restart(None))
+            self.after(0, lambda: self._finish_codex_restart(None, result.action))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _finish_codex_restart(self, error: str | None) -> None:
+    def _finish_codex_restart(self, error: str | None, action: str = "restart") -> None:
         self.restart_codex_button.configure(state="normal", cursor="hand2")
         if error:
             self.show_error(f"重启 Codex 失败：\n{error}")
             return
-        self._notify("Codex 已重新启动。")
+        self._notify("Codex 已启动。" if action == "start" else "Codex 已重新启动。")
 
     def _new_page(self, key: str) -> tk.Frame:
         page = tk.Frame(self.page_host, bg="#f3f4f7")
