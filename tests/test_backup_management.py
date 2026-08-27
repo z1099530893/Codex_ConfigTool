@@ -393,10 +393,8 @@ class BackupManagementTests(unittest.TestCase):
         self.assertIn('conversation_id = "keep-this"', current_config)
         self.assertEqual("active-key", app.read_codex_config(self.config_dir).api_key)
         self.assertEqual("Active Provider", app.read_codex_config(self.config_dir).provider)
-        self.assertEqual(
-            app.capture_config_files(created.path),
-            app.capture_config_files(self.config_dir),
-        )
+        self.assertIn('conversation_id = "keep-this"', current_config)
+        self.assertIn('disable_response_storage = true', current_config)
 
     def test_template_state_save_preserves_existing_files(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -614,8 +612,119 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(2, builder.call_count)
         self.assertNotEqual(first, changed)
 
-    def test_restore_default_does_not_create_a_profile_or_delete_other_data(self) -> None:
-        self.write_config(self.config_dir, "A")
+    def test_model_list_endpoint_appends_models_to_api_root(self) -> None:
+        self.assertEqual(
+            "https://provider.example.com/v1/models",
+            app.model_list_endpoint("https://provider.example.com/v1/"),
+        )
+        self.assertEqual(
+            "http://127.0.0.1:1234/models",
+            app.model_list_endpoint("http://127.0.0.1:1234"),
+        )
+        self.assertEqual(
+            "https://provider.example.com/v1/models",
+            app.model_list_endpoint("https://provider.example.com/v1/models"),
+        )
+
+    def test_model_list_parser_deduplicates_and_sorts_model_ids(self) -> None:
+        payload = json.dumps(
+            {
+                "object": "list",
+                "data": [
+                    {"id": "gpt-z"},
+                    {"id": " gpt-a "},
+                    {"id": "gpt-z"},
+                    {"name": "ignored"},
+                ],
+            }
+        ).encode("utf-8")
+
+        self.assertEqual(["gpt-a", "gpt-z"], app.parse_model_list(payload))
+
+    def test_fetch_models_uses_bearer_auth_and_disables_redirects(self) -> None:
+        calls = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, size):
+                calls["read_size"] = size
+                return b'{"data":[{"id":"gpt-test"}]}'
+
+        class Opener:
+            def open(self, request, timeout):
+                calls["url"] = request.full_url
+                calls["authorization"] = request.get_header("Authorization")
+                calls["timeout"] = timeout
+                return Response()
+
+        with patch.object(app.urllib.request, "build_opener", return_value=Opener()) as builder:
+            models = app.fetch_available_models("https://provider.example.com/v1", " secret-key ", 3.5)
+
+        self.assertEqual(["gpt-test"], models)
+        self.assertEqual("https://provider.example.com/v1/models", calls["url"])
+        self.assertEqual("Bearer secret-key", calls["authorization"])
+        self.assertEqual(3.5, calls["timeout"])
+        self.assertEqual(app.MODEL_LIST_MAX_BYTES + 1, calls["read_size"])
+        self.assertIsInstance(builder.call_args.args[0], app._NoRedirectHandler)
+
+    def test_model_selection_updates_current_and_matching_saved_profile(self) -> None:
+        active = self.create_profile(
+            "Active",
+            "Provider A",
+            extra_config='[session]\nconversation_id = "keep-this"',
+        )
+
+        updated = app.save_active_model(self.config_dir, "gpt-5.6-sol")
+
+        self.assertEqual(active.path, updated.path)
+        self.assertEqual("gpt-5.6-sol", app.read_codex_config(self.config_dir).model)
+        self.assertEqual("gpt-5.6-sol", app.read_codex_config(active.path).model)
+        self.assertIn(
+            'conversation_id = "keep-this"',
+            (self.config_dir / "config.toml").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(active.path, app.find_matching_backup(self.config_dir).path)
+
+    def test_model_selection_only_updates_current_when_it_is_unsaved(self) -> None:
+        saved = self.create_profile("Saved", "Provider A", model="gpt-old")
+        self.write_config(self.config_dir, "Provider B", model="gpt-current")
+
+        updated = app.save_active_model(self.config_dir, "gpt-new")
+
+        self.assertIsNone(updated)
+        self.assertEqual("gpt-new", app.read_codex_config(self.config_dir).model)
+        self.assertEqual("gpt-old", app.read_codex_config(saved.path).model)
+
+    def test_model_selection_rolls_back_profile_when_current_write_fails(self) -> None:
+        active = self.create_profile("Active", "Provider A", model="gpt-old")
+        current_before = app.capture_config_files(self.config_dir)
+        profile_before = app.capture_config_files(active.path)
+        real_update = app.update_config_model
+
+        def fail_current_write(config_path: Path, model: str) -> None:
+            if config_path.parent.resolve() == self.config_dir.resolve():
+                raise OSError("injected current model write failure")
+            real_update(config_path, model)
+
+        with patch.object(app, "update_config_model", side_effect=fail_current_write):
+            with self.assertRaises(OSError):
+                app.save_active_model(self.config_dir, "gpt-new")
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(profile_before, app.capture_config_files(active.path))
+
+    def test_restore_default_preserves_config_auth_and_session_data(self) -> None:
+        self.write_config(
+            self.config_dir,
+            "A",
+            extra_config='[session]\nconversation_id = "keep-this"\n[desktop]\nwindow_state = "open"',
+            extra_auth={"tokens": {"access_token": "keep-token"}, "account_id": "account-1", "other": "keep"},
+        )
         sessions = self.config_dir / "sessions"
         sessions.mkdir()
         marker = sessions / "keep.txt"
@@ -623,10 +732,59 @@ class BackupManagementTests(unittest.TestCase):
 
         app.restore_default_config(self.config_dir)
 
-        self.assertFalse((self.config_dir / "auth.json").exists())
-        self.assertFalse((self.config_dir / "config.toml").exists())
+        auth = json.loads((self.config_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertNotIn("OPENAI_API_KEY", auth)
+        self.assertEqual({"access_token": "keep-token"}, auth["tokens"])
+        self.assertEqual("account-1", auth["account_id"])
+        self.assertEqual("keep", auth["other"])
+        config_text = (self.config_dir / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('model_provider = "openai"', config_text)
+        self.assertIn('conversation_id = "keep-this"', config_text)
+        self.assertIn('window_state = "open"', config_text)
         self.assertEqual("keep", marker.read_text(encoding="utf-8"))
-        self.assertEqual([], app.list_backup_records(self.config_dir))
+
+    def test_api_official_api_round_trip_preserves_current_session_identity(self) -> None:
+        api_a = self.create_profile(
+            "API-A",
+            "Provider A",
+            extra_config='[session]\nconversation_id = "thread-a"',
+            extra_auth={"tokens": {"access_token": "chatgpt-token"}, "account_id": "acct"},
+        )
+        app.apply_saved_profile(self.config_dir, api_a.path)
+        app.restore_default_config(self.config_dir)
+        config_path = self.config_dir / "config.toml"
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8") + '\n[session]\nconversation_id = "thread-official"\n',
+            encoding="utf-8",
+        )
+        official_snapshot = app.capture_config_files(self.config_dir)
+        api_k = self.create_profile("API-K", "Provider K", api_key="key-k")
+        app.restore_config_files(self.config_dir, official_snapshot)
+        app.apply_saved_profile(self.config_dir, api_k.path)
+
+        current = app.read_codex_config(self.config_dir)
+        self.assertEqual("Provider K", current.provider)
+        self.assertEqual("key-k", current.api_key)
+        current_text = config_path.read_text(encoding="utf-8")
+        self.assertIn('conversation_id = "thread-official"', current_text)
+        auth = json.loads((self.config_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual("chatgpt-token", auth["tokens"]["access_token"])
+        self.assertEqual("acct", auth["account_id"])
+
+    def test_restore_default_rolls_back_both_files_on_failure(self) -> None:
+        self.write_config(self.config_dir, "A", extra_auth={"tokens": {"access_token": "keep"}})
+        before = app.capture_config_files(self.config_dir)
+        real_write = app.write_text
+
+        def fail_config(path: Path, content: str) -> None:
+            if path.name == "config.toml":
+                raise OSError("injected config failure")
+            real_write(path, content)
+
+        with patch.object(app, "write_text", side_effect=fail_config):
+            with self.assertRaises(OSError):
+                app.restore_default_config(self.config_dir)
+        self.assertEqual(before, app.capture_config_files(self.config_dir))
 
     def test_unreadable_core_config_is_never_matched(self) -> None:
         self.create_profile("A", "A")

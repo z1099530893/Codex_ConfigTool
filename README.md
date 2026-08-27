@@ -1,24 +1,25 @@
 # Codex 配置助手
 
-Codex 配置助手 `1.3.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库、Tkinter 和 PyInstaller，不联网，也不会上传 API Key。
+Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库、Tkinter 和 PyInstaller。除非用户主动点击“获取模型”，否则程序不会联网；获取模型时只会将 API Key 发送到用户填写的 Base URL，不会上传到其他服务。
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版 `CodexConfigTool-v1.3.0.exe`。程序为单文件版本，无需安装。
+前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版 `CodexConfigTool-v1.4.0.exe`。程序为单文件版本，无需安装。
 
 ## 功能
 
 - 自动识别、手动选择 Codex 配置目录
 - 读取和编辑 API Key、Provider 显示名称、Base URL 和 Model
+- 从当前供应商的 OpenAI 兼容 `/models` 接口获取可用模型，支持下拉选择和手动输入
 - 长 API Key 支持平滑滚轮浏览、键盘定位和越界拖选
 - API Key 等配置文件绝不上传，保护隐私
 - 新增配置并保存到配置库
 - 在配置库中搜索、排序、切换、完整编辑、删除配置
-- 双击“配置名称”即可切换到该配置
+- 双击配置列表中的任意有效行区域即可切换到该配置
 - 支持右键菜单、全选、Ctrl+A 和鼠标左键拖选批量操作
 - 多选状态右键只提供批量删除，不提供无意义的单项编辑
 - 配置永久保留，不设数量上限，不会自动删除或更新时间
-- 当前配置只读展示，切换配置不弹出保存或确认窗口
+- 当前配置页保持连接信息只读，选择模型后自动保存并同步当前配置库记录
 - 官方登录模式和启动新手引导询问
 - 左侧一键启动或重启 Codex，并在执行前进行确认
 - Windows 单实例限制，避免多个窗口交叉修改配置
@@ -38,19 +39,19 @@ Codex 配置助手 `1.3.0` 是一个 Windows 桌面工具，用于管理和切�
 
 ### 当前配置
 
-“当前配置”页面只读展示正在使用的配置名称、API Key、Provider 显示名称、Base URL 和 Model。API Key 默认隐藏，可以使用输入框中的眼睛图标切换显示。页面上方可以浏览 Codex 配置目录，也可以基于当前配置新增配置。
+“当前配置”页面展示正在使用的配置名称、API Key、Provider 显示名称、Base URL 和 Model。API Key、Provider 与 Base URL 保持只读；Model 可以直接手动输入，也可以点击“获取模型”访问当前 Base URL 的 OpenAI 兼容 `/models` 接口后从下拉列表选择。下拉选择会立即保存；手动输入后按 `Enter` 或离开输入框时自动保存，按 `Esc` 可放弃输入。当前内容匹配配置库中的记录时，也会同步更新该记录。API Key 默认隐藏，可以使用输入框中的眼睛图标切换显示。页面上方可以浏览 Codex 配置目录，也可以基于当前配置新增配置。
 
 ![当前配置页面](docs/images/current-config.png)
 
 ### 切换配置
 
-“切换配置”页面按配置名称和 Base URL 展示配置库。绿色圆点表示当前配置；可以搜索、排序、编辑、删除或切换配置，并支持右键菜单、全选、`Ctrl+A` 和鼠标左键拖选；双击“配置名称”即可切换到该配置。
+“切换配置”页面按配置名称和 Base URL 展示配置库。绿色圆点表示当前配置；可以搜索、排序、编辑、删除或切换配置，并支持右键菜单、全选、`Ctrl+A` 和鼠标左键拖选；双击配置名称、Base URL 或同一行空白区域均可切换到该配置。
 
 ![已保存配置页面](docs/images/saved-configurations.png)
 
 ### 官方登录
 
-“官方登录”用于恢复 Codex 官方登录模式。确认后只删除当前目录中的 `auth.json` 和 `config.toml`，聊天记录、本地数据库、日志和配置库都会保留。
+“官方登录”用于切换到 Codex 官方登录模式。确认后只移除当前配置中的 API Key，并切换到官方 `openai` Provider；不会删除 `auth.json`、`config.toml`、聊天记录或会话数据，之后可随时切回已保存的 API 配置。
 
 ![官方登录页面](docs/images/official-login.png)
 
@@ -83,6 +84,8 @@ Codex 配置助手 `1.3.0` 是一个 Windows 桌面工具，用于管理和切�
 
 ## 配置库
 
+官方登录与 API 配置切换采用非破坏性合并：官方模式只移除 `OPENAI_API_KEY`，保留 `config.toml`、ChatGPT 登录令牌和全部会话数据；切回 API 配置时只更新 Provider、Base URL、Model 与 API Key，不覆盖会话期间产生的字段。
+
 配置库位于当前 Codex 目录的 `backups/` 子目录，每个配置使用以下目录格式：
 
 ```text
@@ -103,6 +106,8 @@ yyyyMMdd-HHmmss-配置名称/
 - 顶层 `model`
 
 程序不会修改聊天记录、SQLite 数据库、日志或未涉及的 Codex 桌面状态。普通编辑不会修改现有配置的 `model_provider` 或 Provider 段名；只有当前配置是内置 openai 且需要新增自定义 Provider 时，才会保留其他内容并添加新的 Provider 段。无法安全识别的复杂配置会停止处理并提示用户。
+
+“获取模型”是唯一主动发起的供应商网络请求。请求使用当前 Base URL、最多等待 8 秒、限制响应大小并禁止跨地址重定向，以免 API Key 被转发到其它地址。供应商不支持标准 `/models` 接口或请求失败时，现有 Model 和配置文件保持不变。
 
 写入 `auth.json`、`config.toml` 和工具设置时，程序会先在目标目录写入并同步临时文件，再通过 `os.replace` 原子替换。保存两份核心配置时任一步骤失败，程序会恢复操作前的两份文件。配置库签名和列表搜索信息最多缓存 512 个目录，并依据文件是否存在、大小、纳秒修改时间和创建时间自动失效。
 
@@ -127,7 +132,7 @@ python -m py_compile codex_config_tool.py
 python -m unittest discover -s tests -q
 ```
 
-测试使用临时配置目录，不应读取或修改真实用户的 `.codex`。测试包含写入/替换故障注入、事务回滚和缓存失效检查。
+测试使用临时配置目录，不应读取或修改真实用户的 `.codex`。测试包含写入/替换故障注入、事务回滚、缓存失效、模型列表解析和模型同步保存检查。
 
 ## 打包
 

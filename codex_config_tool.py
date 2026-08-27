@@ -9,17 +9,20 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, ttk
+from tkinter import filedialog, ttk
 
 
 APP_NAME = "Codex 配置助手"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
@@ -55,6 +58,10 @@ ONBOARDING_SHOWN_KEY = "onboarding_shown"
 SINGLE_INSTANCE_MUTEX_NAME = "Local\\z1099530893.CodexConfigTool"
 ERROR_ALREADY_EXISTS = 183
 PROFILE_CACHE_LIMIT = 512
+MODEL_LIST_TIMEOUT_SECONDS = 8.0
+MODEL_LIST_MAX_BYTES = 2 * 1024 * 1024
+MODEL_LIST_MAX_ITEMS = 5000
+MODEL_ID_MAX_LENGTH = 256
 CODEX_PACKAGE_PATH_PATTERN = re.compile(
     r"[\\/]WindowsApps[\\/](?P<identity>OpenAI\.Codex)_[^\\/]+__(?P<publisher>[^\\/]+)[\\/]",
     re.IGNORECASE,
@@ -685,6 +692,15 @@ class BackupNameConflictError(BackupNameError):
     pass
 
 
+class ModelListError(RuntimeError):
+    pass
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def read_text(path: Path) -> str:
     for encoding in ("utf-8-sig", "utf-8", "gbk"):
         try:
@@ -692,6 +708,89 @@ def read_text(path: Path) -> str:
         except UnicodeDecodeError:
             continue
     return path.read_text(errors="replace")
+
+
+def model_list_endpoint(base_url: str) -> str:
+    base_url = base_url.strip()
+    if any(character in base_url for character in "\r\n\t"):
+        raise ModelListError("Base URL 包含无效字符。")
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise ModelListError("Base URL 格式无效。") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        raise ModelListError("Base URL 需要是有效的 http:// 或 https:// 地址。")
+    if parsed.username is not None or parsed.password is not None:
+        raise ModelListError("Base URL 不能包含用户名或密码。")
+
+    path = parsed.path.rstrip("/")
+    if not path.lower().endswith("/models"):
+        path += "/models"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def parse_model_list(payload: bytes) -> list[str]:
+    try:
+        data = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ModelListError("模型接口没有返回有效的 JSON。") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise ModelListError("模型接口响应缺少 data 列表。")
+
+    models = set()
+    for item in data["data"]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        model_id = item["id"].strip()
+        if not model_id or len(model_id) > MODEL_ID_MAX_LENGTH or re.search(r"[\x00-\x1f\x7f]", model_id):
+            continue
+        models.add(model_id)
+        if len(models) >= MODEL_LIST_MAX_ITEMS:
+            break
+    if not models:
+        raise ModelListError("模型接口没有返回可用的模型。")
+    return sorted(models, key=str.casefold)
+
+
+def fetch_available_models(
+    base_url: str,
+    api_key: str,
+    timeout: float = MODEL_LIST_TIMEOUT_SECONDS,
+) -> list[str]:
+    endpoint = model_list_endpoint(base_url)
+    api_key = api_key.strip()
+    if "\r" in api_key or "\n" in api_key:
+        raise ModelListError("API Key 包含无效字符。")
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"CodexConfigTool/{APP_VERSION}",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        request = urllib.request.Request(endpoint, headers=headers, method="GET")
+    except (ValueError, UnicodeError) as exc:
+        raise ModelListError("模型接口地址无效。") from exc
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            payload = response.read(MODEL_LIST_MAX_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise ModelListError(f"模型接口返回 HTTP {exc.code}。") from exc
+    except urllib.error.URLError as exc:
+        reason = str(exc.reason).strip() or "连接失败"
+        raise ModelListError(f"无法连接模型接口：{reason}") from exc
+    except TimeoutError as exc:
+        raise ModelListError("连接模型接口超时。") from exc
+    except OSError as exc:
+        raise ModelListError(f"无法连接模型接口：{exc}") from exc
+    except (ValueError, UnicodeError) as exc:
+        raise ModelListError("模型接口地址无效。") from exc
+
+    if len(payload) > MODEL_LIST_MAX_BYTES:
+        raise ModelListError("模型接口响应过大，已停止读取。")
+    return parse_model_list(payload)
 
 
 def atomic_write_bytes(path: Path, content: bytes) -> None:
@@ -946,6 +1045,21 @@ def replace_existing_top_level(lines: list[str], key: str, value: str) -> list[s
         output.append(line)
     if not replaced:
         raise ConfigConflictError(f"没有找到可修改的顶层 {key}")
+    return output
+
+
+def remove_top_level_key(lines: list[str], key: str) -> list[str]:
+    """Remove one managed top-level key while preserving comments and sections."""
+    output = []
+    current_section = None
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for line in lines:
+        section = section_name_from_line(line)
+        if section is not None:
+            current_section = section
+        if current_section is None and pattern.match(line):
+            continue
+        output.append(line)
     return output
 
 
@@ -1532,23 +1646,52 @@ def drag_selection_items(
     return tuple(item for item in ordered_items if item in selected)
 
 
-def restore_backup(config_dir: Path, backup_dir: Path) -> None:
+def _profile_provider_fields(profile_dir: Path) -> tuple[str, str, str, str]:
+    config_path = profile_dir / "config.toml"
+    if not config_path.exists():
+        raise OSError("选择的配置缺少 config.toml。")
+    lines = read_text(config_path).splitlines(keepends=True)
+    provider_id = get_top_level_value(lines, "model_provider") or DEFAULT_PROVIDER
+    section = f"model_providers.{provider_id}"
+    provider_name = get_section_value(lines, section, "name") or provider_id
+    base_url = get_section_value(lines, section, "base_url") or DEFAULT_BASE_URL
+    model = get_top_level_value(lines, "model") or TEMPLATE_MODEL
+    return provider_id, provider_name, base_url, model
+
+
+def apply_saved_profile(config_dir: Path, backup_dir: Path) -> None:
+    """Merge a saved API profile into live files without replacing session state."""
     backup_dir = validate_backup_path(config_dir, backup_dir)
-    if not ((backup_dir / "auth.json").exists() or (backup_dir / "config.toml").exists()):
+    source_auth = backup_dir / "auth.json"
+    source_config = backup_dir / "config.toml"
+    if not (source_auth.exists() or source_config.exists()):
         raise OSError("选择的配置不包含可使用的配置文件。")
     snapshot = capture_config_files(config_dir)
     try:
-        for file_name in ("auth.json", "config.toml"):
-            source = backup_dir / file_name
-            target = config_dir / file_name
-            if source.exists():
-                atomic_copy_file(source, target)
-            elif target.exists():
-                target.unlink()
+        if source_config.exists():
+            provider_id, provider_name, base_url, model = _profile_provider_fields(backup_dir)
+            config_path = config_dir / "config.toml"
+            lines = read_text(config_path).splitlines(keepends=True) if config_path.exists() else []
+            lines = replace_or_insert_top_level(lines, "model_provider", provider_id)
+            lines = replace_or_insert_top_level(lines, "model", model)
+            lines = replace_or_insert_top_level(lines, "preferred_auth_method", "apikey")
+            section = f"model_providers.{provider_id}"
+            lines = replace_or_insert_section_value(lines, section, "name", provider_name)
+            lines = replace_or_insert_section_value(lines, section, "base_url", base_url)
+            write_text(config_path, "".join(lines))
+        if source_auth.exists():
+            source_data = json.loads(read_text(source_auth))
+            if not isinstance(source_data, dict):
+                raise ConfigConflictError("备份 auth.json 不是对象结构，无法应用")
+            update_auth_json(config_dir / "auth.json", str(source_data.get("OPENAI_API_KEY", "")))
         save_settings(config_dir)
-    except OSError:
+    except (OSError, json.JSONDecodeError):
         restore_config_files(config_dir, snapshot)
         raise
+
+
+def restore_backup(config_dir: Path, backup_dir: Path) -> None:
+    apply_saved_profile(config_dir, backup_dir)
 
 
 def normalize_provider(provider: str, base_url: str) -> str:
@@ -1693,6 +1836,43 @@ def update_existing_config_toml(config_path: Path, display_name: str, base_url: 
     write_text(config_path, "".join(lines))
 
 
+def update_config_model(config_path: Path, model: str) -> None:
+    model = model.strip()
+    if not model:
+        raise ConfigConflictError("Model 不能为空。")
+    if not config_path.exists():
+        raise ConfigConflictError("当前配置缺少 config.toml。")
+
+    lines = read_text(config_path).splitlines(keepends=True)
+    if count_top_level_key(lines, "model") != 1:
+        raise ConfigConflictError("config.toml 顶层没有唯一的 model 可供修改。")
+    write_text(config_path, "".join(replace_existing_top_level(lines, "model", model)))
+
+
+def save_active_model(config_dir: Path, model: str) -> BackupRecord | None:
+    """Update only the active model and keep its matching saved profile in sync."""
+    model = model.strip()
+    current_config = read_codex_config(config_dir)
+    active_profile = find_matching_backup(config_dir)
+    if model == current_config.model:
+        return active_profile
+
+    current_snapshot = capture_config_files(config_dir)
+    profile_snapshot = capture_config_files(active_profile.path) if active_profile is not None else None
+    try:
+        if active_profile is not None:
+            update_config_model(active_profile.path / "config.toml", model)
+        update_config_model(config_dir / "config.toml", model)
+    except OSError:
+        restore_config_files(config_dir, current_snapshot)
+        if active_profile is not None and profile_snapshot is not None:
+            restore_config_files(active_profile.path, profile_snapshot)
+        raise
+    finally:
+        clear_profile_cache()
+    return active_profile
+
+
 def save_codex_config(
     config_dir: Path,
     api_key: str,
@@ -1732,12 +1912,16 @@ def restore_default_config(config_dir: Path) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
     snapshot = capture_config_files(config_dir)
     try:
-        for file_name in ("auth.json", "config.toml"):
-            path = config_dir / file_name
-            if path.exists():
-                path.unlink()
+        auth_path = config_dir / "auth.json"
+        if auth_path.exists():
+            update_auth_json(auth_path, "")
+        config_path = config_dir / "config.toml"
+        lines = read_text(config_path).splitlines(keepends=True) if config_path.exists() else []
+        lines = replace_or_insert_top_level(lines, "model_provider", DEFAULT_PROVIDER)
+        lines = remove_top_level_key(lines, "preferred_auth_method")
+        write_text(config_path, "".join(lines))
         save_settings(config_dir)
-    except OSError:
+    except (OSError, json.JSONDecodeError):
         restore_config_files(config_dir, snapshot)
         raise
 
@@ -1950,6 +2134,8 @@ class CodexConfigApp(tk.Tk):
         self.model_var = tk.StringVar(value=TEMPLATE_MODEL)
         self.api_key_var = tk.StringVar()
         self.show_key_var = tk.BooleanVar(value=False)
+        self._model_fetch_in_progress = False
+        self._current_saved_model = TEMPLATE_MODEL
         self.status_var = tk.StringVar(value="请选择 Codex 配置目录")
         self.current_config_name_var = tk.StringVar(value="未保存配置")
         self.current_config_prefix_var = tk.StringVar(value="")
@@ -2057,6 +2243,62 @@ class CodexConfigApp(tk.Tk):
         style.configure("Danger.TButton", font=("Microsoft YaHei UI", 9), padding=(10, 6), foreground="#a33a32")
         style.configure("TEntry", padding=6, relief="flat", borderwidth=1)
         style.configure("Readonly.TEntry", padding=6, fieldbackground="#f7f8f9", foreground="#343a43")
+        style.configure(
+            "Model.TCombobox",
+            padding=(6, 5, 34, 5),
+            fieldbackground="#f7f8f9",
+            foreground="#343a43",
+            borderwidth=1,
+            bordercolor="#a8adb2",
+            lightcolor="#a8adb2",
+            darkcolor="#a8adb2",
+            relief="flat",
+        )
+        style.layout(
+            "Model.TCombobox",
+            [
+                (
+                    "Combobox.field",
+                    {
+                        "sticky": "nswe",
+                        "children": [
+                            (
+                                "Combobox.padding",
+                                {
+                                    "expand": "1",
+                                    "sticky": "nswe",
+                                    "children": [("Combobox.textarea", {"sticky": "nswe"})],
+                                },
+                            )
+                        ],
+                    },
+                )
+            ],
+        )
+        style.map(
+            "Model.TCombobox",
+            fieldbackground=[("readonly", "#f7f8f9")],
+            foreground=[("disabled", "#9aa0a8")],
+        )
+        style.configure(
+            "ComboboxPopdownFrame",
+            background="#a8adb2",
+            bordercolor="#a8adb2",
+            lightcolor="#a8adb2",
+            darkcolor="#a8adb2",
+            borderwidth=1,
+            relief="flat",
+        )
+        self.option_add("*TCombobox*Listbox.background", "#ffffff")
+        self.option_add("*TCombobox*Listbox.foreground", "#303640")
+        self.option_add("*TCombobox*Listbox.selectBackground", "#2f6f5e")
+        self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        self.option_add("*TCombobox*Listbox.relief", "flat")
+        self.option_add("*TCombobox*Listbox.borderWidth", 0)
+        self.option_add("*TCombobox*Listbox.highlightThickness", 1)
+        self.option_add("*TCombobox*Listbox.highlightBackground", "#a8adb2")
+        self.option_add("*TCombobox*Listbox.highlightColor", "#a8adb2")
+        self.option_add("*TCombobox*Listbox.font", "{Microsoft YaHei UI} 9")
         style.configure("Key.TEntry", padding=(6, 6, 36, 6), relief="flat", borderwidth=1)
         style.configure(
             "ReadonlyKey.TEntry",
@@ -2492,7 +2734,7 @@ class CodexConfigApp(tk.Tk):
         self.key_entry = self._readonly_field(details, 0, "API Key", self.api_key_var, secret=True)
         self._readonly_field(details, 1, "Provider 显示名称", self.provider_var)
         self._readonly_field(details, 2, "Base URL", self.base_url_var)
-        self._readonly_field(details, 3, "Model", self.model_var)
+        self._model_field(details, 3)
 
     def _readonly_field(self, parent: tk.Misc, row: int, label: str, variable: tk.StringVar, secret: bool = False) -> ttk.Entry:
         tk.Label(parent, text=label, bg="#ffffff", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=6)
@@ -2512,17 +2754,120 @@ class CodexConfigApp(tk.Tk):
             self.key_toggle_button.place(relx=1.0, rely=0.5, anchor="e", x=-6, y=0)
         return entry
 
+    def _model_field(self, parent: tk.Misc, row: int) -> None:
+        tk.Label(parent, text="Model", bg="#ffffff", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(
+            row=row,
+            column=0,
+            sticky="w",
+            padx=(0, 18),
+            pady=6,
+        )
+        field = tk.Frame(parent, bg="#ffffff")
+        field.grid(row=row, column=1, sticky="ew", pady=6)
+        self.model_combo = ttk.Combobox(
+            field,
+            textvariable=self.model_var,
+            values=(self.model_var.get(),),
+            state="normal",
+            style="Model.TCombobox",
+        )
+        self.model_combo.pack(side="left", fill="both", expand=True, ipady=1)
+        self.model_combo.bind("<<ComboboxSelected>>", self._select_current_model)
+        self.model_combo.bind("<Return>", self._select_current_model)
+        self.model_combo.bind("<FocusOut>", self._select_current_model)
+        self.model_combo.bind("<Escape>", self._cancel_current_model_edit)
+        self.model_dropdown_button = tk.Canvas(
+            field,
+            width=28,
+            height=29,
+            bg="#f7f8f9",
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        self.model_dropdown_button.place(
+            in_=self.model_combo,
+            relx=1.0,
+            rely=0.5,
+            anchor="e",
+            x=-1,
+            width=28,
+            height=29,
+        )
+        self._draw_model_dropdown_button()
+        self.model_dropdown_button.bind("<Enter>", lambda _event: self._draw_model_dropdown_button(True))
+        self.model_dropdown_button.bind("<Leave>", lambda _event: self._draw_model_dropdown_button())
+        self.model_dropdown_button.bind("<Button-1>", self._post_model_dropdown)
+        self.fetch_models_button = ttk.Button(
+            field,
+            text="获取模型",
+            command=self.fetch_models,
+            style="Secondary.TButton",
+            width=10,
+        )
+        self.fetch_models_button.pack(side="left", padx=(8, 0), ipady=3)
+
+    def _draw_model_dropdown_button(self, active: bool = False) -> None:
+        button = self.model_dropdown_button
+        button.configure(bg="#edf0f2" if active else "#f7f8f9")
+        button.delete("all")
+        button.create_line(8, 11, 13, 16, 18, 11, fill="#59616d", width=2, joinstyle="round")
+        button.create_rectangle(27, 0, 28, 29, fill="#a8adb2", outline="")
+
+    def _post_model_dropdown(self, _event=None) -> str:
+        if str(self.model_combo.cget("state")) == "disabled":
+            return "break"
+        self.model_combo.focus_set()
+        try:
+            self.model_combo.tk.call("ttk::combobox::Post", str(self.model_combo))
+            popup = self.model_combo.tk.call("ttk::combobox::PopdownWindow", str(self.model_combo))
+            self.model_combo.tk.call(popup, "configure", "-borderwidth", 0)
+            right_border = f"{popup}.model_right_border"
+            if not self.model_combo.tk.call("winfo", "exists", right_border):
+                self.model_combo.tk.call(
+                    "frame",
+                    right_border,
+                    "-background",
+                    "#a8adb2",
+                    "-borderwidth",
+                    0,
+                    "-highlightthickness",
+                    0,
+                )
+            self.model_combo.tk.call(
+                "place",
+                right_border,
+                "-in",
+                popup,
+                "-relx",
+                1.0,
+                "-x",
+                -1,
+                "-rely",
+                0,
+                "-anchor",
+                "ne",
+                "-width",
+                1,
+                "-relheight",
+                1.0,
+            )
+            self.model_combo.tk.call("raise", right_border)
+            scrollbar = f"{popup}.f.sb"
+            if self.model_combo.tk.call("winfo", "exists", scrollbar):
+                self.model_combo.tk.call("grid", "remove", scrollbar)
+        except tk.TclError:
+            self.model_combo.event_generate("<Alt-Down>")
+        return "break"
+
     def _build_official_page(self) -> None:
         page = self._new_page("official")
-        self._page_header(page, "官方登录", "恢复 Codex 官方登录配置，用自己的 ChatGPT/GPT 账号登录。")
+        self._page_header(page, "官方登录", "切换到 Codex 官方登录配置，用自己的 ChatGPT/GPT 账号登录。")
         panel = self._panel(page, (20, 18))
         tk.Label(panel, textvariable=self.official_status_var, bg="#ffffff", fg="#20242b", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
         tk.Label(
             panel,
-            text=(
-                "执行后会删除当前目录中的 auth.json 和 config.toml，由 Codex 在下次启动时重新生成。\n"
-                "聊天记录、本地数据库、日志和配置库中的已保存配置不会被删除。"
-            ),
+            text="切换后不会丢失聊天记录，已保存的 API 配置也会保留。",
             bg="#ffffff",
             fg="#5f6773",
             justify="left",
@@ -2932,28 +3277,10 @@ class CodexConfigApp(tk.Tk):
         item = self.profile_tree.identify_row(event.y)
         if not item or item not in self.profile_records_by_item or self.profile_multi_mode:
             return "break"
-        column = self.profile_tree.identify_column(event.x)
-        if self._profile_click_hits_text(item, column, event.x):
-            return "break"
         self.profile_tree.selection_set(item)
         self.profile_tree.focus(item)
         self._switch_selected_profile()
         return "break"
-
-    def _profile_click_hits_text(self, item: str, column: str, x: int) -> bool:
-        if column not in {"#1", "#2"}:
-            return False
-        values = self.profile_tree.item(item, "values")
-        index = int(column[1:]) - 1
-        if index >= len(values):
-            return False
-        cell = self.profile_tree.bbox(item, column)
-        if not cell:
-            return False
-        font_spec = ttk.Style().lookup("Treeview", "font") or ("Microsoft YaHei UI", 9)
-        text_width = tkfont.Font(font=font_spec).measure(str(values[index]))
-        text_start = cell[0] + 6
-        return text_start <= x <= text_start + text_width + 4
 
     def _delete_profile_records(self, records: list[BackupRecord]) -> None:
         if not records:
@@ -3647,6 +3974,9 @@ class CodexConfigApp(tk.Tk):
         self.provider_var.set(config.provider or DEFAULT_PROVIDER)
         self.base_url_var.set(config.base_url or DEFAULT_BASE_URL)
         self.model_var.set(config.model or TEMPLATE_MODEL)
+        self._current_saved_model = self.model_var.get()
+        if hasattr(self, "model_combo"):
+            self.model_combo.configure(values=(self.model_var.get(),))
         matching_profile = None if official_login_mode else find_matching_backup(path)
         if official_login_mode:
             self.current_config_prefix_var.set("正在使用：")
@@ -3662,6 +3992,7 @@ class CodexConfigApp(tk.Tk):
             self.current_config_suffix_var.set("")
         save_settings(path)
         self._refresh_official_page()
+        self._refresh_model_control_state()
         if hasattr(self, "profile_tree") and self.active_page == "profiles":
             self.refresh_profiles()
         if template_created:
@@ -3682,6 +4013,97 @@ class CodexConfigApp(tk.Tk):
         self._notify(f"已读取：{path}（{'，'.join(markers)}）")
     def reload_current(self) -> None:
         self.load_path(self.current_path())
+
+    def _refresh_model_control_state(self) -> None:
+        if not hasattr(self, "fetch_models_button"):
+            return
+        path = self.current_path()
+        state, _issues = classify_config_for_editing(path)
+        enabled = state == "editable" and not is_official_login_mode(path)
+        self.model_combo.configure(state="normal" if enabled else "readonly")
+        self.fetch_models_button.configure(
+            state="normal" if enabled and not self._model_fetch_in_progress else "disabled"
+        )
+
+    def fetch_models(self) -> None:
+        if self._model_fetch_in_progress:
+            return
+        path = self.current_path()
+        state, _issues = classify_config_for_editing(path)
+        if state != "editable" or is_official_login_mode(path):
+            self.show_error("当前配置无法获取或切换模型。")
+            return
+
+        base_url = self.base_url_var.get().strip()
+        api_key = self.api_key_var.get()
+        request_path = normalized_path_key(path)
+        self._model_fetch_in_progress = True
+        self.fetch_models_button.configure(text="获取中...", state="disabled")
+        self._notify("正在获取可用模型...")
+
+        def worker() -> None:
+            try:
+                models = fetch_available_models(base_url, api_key)
+            except ModelListError as exc:
+                self.after(0, lambda: self._finish_model_fetch(request_path, None, str(exc)))
+                return
+            except Exception:
+                self.after(0, lambda: self._finish_model_fetch(request_path, None, "获取模型时发生未知错误。"))
+                return
+            self.after(0, lambda: self._finish_model_fetch(request_path, models, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_model_fetch(
+        self,
+        request_path: str,
+        models: list[str] | None,
+        error: str | None,
+    ) -> None:
+        self._model_fetch_in_progress = False
+        self.fetch_models_button.configure(text="获取模型")
+        self._refresh_model_control_state()
+        if request_path != normalized_path_key(self.current_path()):
+            return
+        if error is not None:
+            self.show_error(f"获取模型失败：\n{error}")
+            return
+
+        current_model = self.model_var.get().strip()
+        available_models = list(models or [])
+        if current_model and current_model not in available_models:
+            available_models.insert(0, current_model)
+        self.model_combo.configure(values=tuple(available_models))
+        self._notify(f"已获取 {len(models or [])} 个可用模型，请从下拉列表选择。", 2800)
+
+    def _select_current_model(self, _event=None) -> None:
+        selected_model = self.model_var.get().strip()
+        previous_model = self._current_saved_model
+        if not selected_model:
+            self.model_var.set(previous_model)
+            return
+        if selected_model == previous_model:
+            return
+
+        path = self.current_path()
+        available_models = tuple(self.model_combo.cget("values"))
+        self.model_combo.configure(state="disabled")
+        try:
+            save_active_model(path, selected_model)
+        except OSError as exc:
+            self.model_var.set(previous_model)
+            self._refresh_model_control_state()
+            self.show_error(f"保存模型失败：\n{exc}")
+            return
+
+        self._current_saved_model = selected_model
+        self.load_path(path)
+        self.model_combo.configure(values=available_models)
+        self._notify(f"模型已切换为 {selected_model}，重启 Codex 后生效。", 2800)
+
+    def _cancel_current_model_edit(self, _event=None) -> str:
+        self.model_var.set(self._current_saved_model)
+        return "break"
 
     def toggle_key_visibility(self) -> None:
         visible = not self.show_key_var.get()
@@ -3766,7 +4188,7 @@ class CodexConfigApp(tk.Tk):
         )
 
     def restore_defaults(self) -> None:
-        message = "是否确认恢复到默认配置？\n\n恢复后请关闭本工具并启动 Codex，按提示登录。"
+        message = "是否进入官方登录模式？\n\n不会丢失聊天记录或已保存的 API 配置。请关闭本工具并启动 Codex，按提示登录。"
         if not self.ask_yes_no(message):
             return
         try:
@@ -3785,8 +4207,8 @@ class CodexConfigApp(tk.Tk):
         self.current_config_suffix_var.set("")
         self._refresh_official_page()
         self.refresh_profiles()
-        self._notify("已进入官方登录模式。")
-        self.show_info("已恢复默认配置。\n\n请关闭本工具并启动 Codex，按提示登录。")
+        self._notify("已进入官方登录模式，现有会话和配置均已保留。")
+        self.show_info("已进入官方登录模式。\n\n聊天记录和已保存的 API 配置均已保留。请关闭本工具并启动 Codex，按提示登录。")
 
     def show_backup_settings(self) -> None:
         self.show_page("profiles")
