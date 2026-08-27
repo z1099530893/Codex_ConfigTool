@@ -26,6 +26,56 @@ class BackupManagementTests(unittest.TestCase):
         self.settings_dir_patch.stop()
         self.temp_dir.cleanup()
 
+    def test_security_validation_rejects_conflicting_permission_keys(self) -> None:
+        issues = app.validate_config_security(
+            'model = "gpt-test"\n'
+            'default_permissions = "ask"\n'
+            'sandbox_mode = "workspace-write"\n'
+        )
+        self.assertTrue(any("同时设置了" in issue for issue in issues))
+
+    def test_security_validation_rejects_invalid_toml(self) -> None:
+        issues = app.validate_config_security("model = [\n")
+        self.assertTrue(any("语法无效" in issue for issue in issues))
+
+    def test_security_validation_detects_duplicate_project_paths(self) -> None:
+        project = self.root / "Project"
+        duplicate = str(project).replace("\\", "/")
+        config = (
+            f"[projects.{app.quote_toml_string(str(project))}]\ntrust_level = \"trusted\"\n\n"
+            f"[projects.{app.quote_toml_string(duplicate)}]\ntrust_level = \"trusted\"\n"
+        )
+        issues = app.validate_config_security(config)
+        self.assertTrue(any("指向同一位置" in issue for issue in issues))
+
+    def test_redact_sensitive_text_hides_api_key(self) -> None:
+        self.assertEqual("请求失败：***", app.redact_sensitive_text("请求失败：secret-key", ("secret-key",)))
+
+    def test_classify_config_rejects_permission_conflict(self) -> None:
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "config.toml").write_text(
+            'model = "gpt-test"\n'
+            'model_provider = "custom"\n'
+            'default_permissions = "ask"\n'
+            'sandbox_mode = "workspace-write"\n'
+            '\n[model_providers.custom]\n'
+            'name = "Custom"\n'
+            'base_url = "https://provider.example.com/v1"\n',
+            encoding="utf-8",
+        )
+        state, issues = app.classify_config_for_editing(self.config_dir)
+        self.assertEqual("conflict", state)
+        self.assertTrue(any("同时设置了" in issue for issue in issues))
+
+    def test_model_update_rejects_unsafe_permission_config(self) -> None:
+        config_path = self.config_dir / "config.toml"
+        config_path.parent.mkdir(parents=True)
+        original = 'model = "old"\nsandbox_mode = "danger-full-access"\n'
+        config_path.write_text(original, encoding="utf-8")
+        with self.assertRaises(app.ConfigConflictError):
+            app.update_config_model(config_path, "new")
+        self.assertEqual(original, config_path.read_text(encoding="utf-8"))
+
     @unittest.skipUnless(os.name == "nt", "Windows named mutex test")
     def test_single_instance_mutex_rejects_duplicate_and_releases(self) -> None:
         name = f"Local\\CodexConfigTool-Test-{os.getpid()}-{id(self)}"

@@ -66,6 +66,7 @@
 - 主窗口通过保留 `WS_CAPTION` 并拦截 `WM_NCCALCSIZE` 获得 Windows 任务栏动画；`_native_wndproc` 必须由实例持续持有，不能改成局部临时回调
 - 主窗口任务栏只使用 `app_icon_title.png`；弹窗和 EXE 使用 `app_icon.ico`，不要用 `iconphoto(True, ...)` 覆盖全部弹窗
 - 左侧功能顺序为当前配置、切换配置、官方登录、一键重启、新手引导
+- 左侧“新手引导”下方提供“推荐渠道”入口，页面展示 AI Ark API 地址；点击地址使用系统默认浏览器打开
 - 当前页面的 API Key、Provider 和 Base URL 只读；Model 可手动输入或通过供应商列表快速切换
 - 点击“获取模型”才允许访问当前 Base URL；请求必须保持超时、大小限制和禁止重定向
 - 当前页下拉选择 Model 后立即保存；手动输入在 Enter 或失去焦点时保存，Esc 放弃；若切换前匹配配置库记录，必须同步更新并在失败时回滚两边
@@ -104,6 +105,7 @@ assets/title_minimize.png
 assets/title_close.png
 assets/eye_smooth.png
 assets/eye_off_smooth.png
+assets/arkapi.png
 assets/app_icon.ico
 version_info.txt
 ```

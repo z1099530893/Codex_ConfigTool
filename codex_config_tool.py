@@ -20,15 +20,22 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, ttk
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 compatibility
+    tomllib = None
+
 
 APP_NAME = "Codex 配置助手"
 APP_VERSION = "1.4.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
+RECOMMENDED_CHANNEL_URL = "https://ai.arkapi.top"
 DONATION_THUMBNAIL_IMAGE_NAME = "donation_105.png"
 DONATION_DIALOG_IMAGE_NAME = "donation_210.png"
 APP_ICON_PNG_NAME = "app_icon.png"
+ARKAPI_ICON_NAME = "arkapi.png"
 APP_ICON_ICO_NAME = "app_icon.ico"
 TITLE_ICON_PNG_NAME = "app_icon_title.png"
 TITLE_ABOUT_ICON_NAME = "title_about.png"
@@ -730,6 +737,48 @@ def model_list_endpoint(base_url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
 
 
+def redact_sensitive_text(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """Remove known secret values before displaying or recording an error."""
+    redacted = str(text)
+    for secret in secrets:
+        secret = str(secret or "").strip()
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    return redacted
+
+
+def validate_config_security(config_text: str) -> list[str]:
+    """Validate TOML syntax and permission-related key combinations without rewriting them."""
+    issues: list[str] = []
+    if tomllib is not None:
+        try:
+            parsed = tomllib.loads(config_text)
+        except tomllib.TOMLDecodeError as exc:
+            return [f"config.toml 语法无效：{exc}"]
+        if not isinstance(parsed, dict):
+            return ["config.toml 顶层结构无效。"]
+        permission_keys = {key for key in ("default_permissions", "sandbox_mode") if key in parsed}
+        if len(permission_keys) == 2:
+            issues.append("config.toml 同时设置了 default_permissions 和 sandbox_mode，请只保留一种权限配置。")
+        if parsed.get("sandbox_mode") == "danger-full-access":
+            issues.append("config.toml 启用了 danger-full-access，软件不会自动扩大此权限。")
+        projects = parsed.get("projects")
+        if isinstance(projects, dict):
+            normalized_projects: dict[str, str] = {}
+            for project_path in projects:
+                if not isinstance(project_path, str):
+                    continue
+                normalized = normalized_path_key(Path(project_path))
+                previous = normalized_projects.get(normalized)
+                if previous is not None and previous != project_path:
+                    issues.append(
+                        f"config.toml 中的项目路径 {previous!r} 和 {project_path!r} 指向同一位置，请保留一条信任记录。"
+                    )
+                else:
+                    normalized_projects[normalized] = project_path
+    return issues
+
+
 def parse_model_list(payload: bytes) -> list[str]:
     try:
         data = json.loads(payload.decode("utf-8-sig"))
@@ -780,11 +829,11 @@ def fetch_available_models(
         raise ModelListError(f"模型接口返回 HTTP {exc.code}。") from exc
     except urllib.error.URLError as exc:
         reason = str(exc.reason).strip() or "连接失败"
-        raise ModelListError(f"无法连接模型接口：{reason}") from exc
+        raise ModelListError(f"无法连接模型接口：{redact_sensitive_text(reason, (api_key,))}") from exc
     except TimeoutError as exc:
         raise ModelListError("连接模型接口超时。") from exc
     except OSError as exc:
-        raise ModelListError(f"无法连接模型接口：{exc}") from exc
+        raise ModelListError(f"无法连接模型接口：{redact_sensitive_text(str(exc), (api_key,))}") from exc
     except (ValueError, UnicodeError) as exc:
         raise ModelListError("模型接口地址无效。") from exc
 
@@ -856,7 +905,7 @@ def load_settings() -> dict:
 
 def save_settings(config_dir: Path) -> None:
     settings = load_settings()
-    settings["config_dir"] = str(config_dir)
+    settings["config_dir"] = str(canonical_config_path(config_dir))
     write_text(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=2))
 
 
@@ -875,6 +924,14 @@ def normalized_path_key(path: Path) -> str:
         return str(path.expanduser().resolve()).lower()
     except OSError:
         return str(path.expanduser()).lower()
+
+
+def canonical_config_path(path: Path) -> Path:
+    """Use one absolute, normalized path for settings and project identity."""
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser().absolute()
 
 
 def is_official_login_mode(config_dir: Path) -> bool:
@@ -1806,7 +1863,11 @@ def classify_config_for_editing(config_dir: Path) -> tuple[str, list[str]]:
     if not config_path.exists():
         return "needs_template", []
 
-    lines = read_text(config_path).splitlines(keepends=True)
+    config_text = read_text(config_path)
+    security_issues = validate_config_security(config_text)
+    if security_issues:
+        return "conflict", security_issues
+    lines = config_text.splitlines(keepends=True)
     provider_count = count_top_level_key(lines, "model_provider")
     provider_sections = model_provider_sections(lines)
     if provider_count == 0 and not provider_sections:
@@ -1843,7 +1904,11 @@ def update_config_model(config_path: Path, model: str) -> None:
     if not config_path.exists():
         raise ConfigConflictError("当前配置缺少 config.toml。")
 
-    lines = read_text(config_path).splitlines(keepends=True)
+    config_text = read_text(config_path)
+    security_issues = validate_config_security(config_text)
+    lines = config_text.splitlines(keepends=True)
+    if security_issues:
+        raise ConfigConflictError("无法安全保存当前配置：\n\n" + "\n".join(f"- {item}" for item in security_issues))
     if count_top_level_key(lines, "model") != 1:
         raise ConfigConflictError("config.toml 顶层没有唯一的 model 可供修改。")
     write_text(config_path, "".join(replace_existing_top_level(lines, "model", model)))
@@ -1887,7 +1952,11 @@ def save_codex_config(
     auth_path = config_dir / "auth.json"
     config_path = config_dir / "config.toml"
     auth_text = read_text(auth_path) if auth_path.exists() else None
-    config_lines = read_text(config_path).splitlines(keepends=True) if config_path.exists() else []
+    config_text = read_text(config_path) if config_path.exists() else ""
+    security_issues = validate_config_security(config_text) if config_text else []
+    if security_issues:
+        raise ConfigConflictError("无法安全保存当前配置：\n\n" + "\n".join(f"- {item}" for item in security_issues))
+    config_lines = config_text.splitlines(keepends=True) if config_text else []
     provider_id = get_top_level_value(config_lines, "model_provider") or DEFAULT_PROVIDER
     conflicts = find_config_conflicts(config_lines, provider_id, auth_text)
     if conflicts:
@@ -2163,6 +2232,7 @@ class CodexConfigApp(tk.Tk):
         self.eye_icon = self._load_ui_image(EYE_ICON_NAME)
         self.eye_off_icon = self._load_ui_image(EYE_OFF_ICON_NAME)
         self.about_mark_image = self._load_ui_image(ABOUT_MARK_PNG_NAME)
+        self.arkapi_icon_image = self._load_ui_image(ARKAPI_ICON_NAME)
         try:
             self.iconbitmap(str(resource_path(APP_ICON_ICO_NAME)))
         except (OSError, tk.TclError):
@@ -2497,6 +2567,7 @@ class CodexConfigApp(tk.Tk):
             self._create_nav_item(nav, key, text)
         self.restart_codex_button = self._create_action_nav_item(nav, "一键重启", self.restart_codex)
         self._create_nav_item(nav, "guide", "新手引导")
+        self._create_nav_item(nav, "recommended", "推荐渠道")
 
         if self.donation_thumbnail is not None:
             donation_button = tk.Button(
@@ -2524,6 +2595,7 @@ class CodexConfigApp(tk.Tk):
         self._build_profiles_page()
         self._build_official_page()
         self._build_guide_page()
+        self._build_recommended_page()
         self.show_page("current")
 
     @staticmethod
@@ -2889,6 +2961,39 @@ class CodexConfigApp(tk.Tk):
             for message in messages:
                 tk.Label(panel, text="• " + message, bg="#ffffff", fg="#4f5865", justify="left", anchor="w", wraplength=500, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(0, 7))
             tk.Frame(panel, bg="#eef0f2", height=1).pack(fill="x", pady=(3, 14))
+
+    def _build_recommended_page(self) -> None:
+        page = self._new_page("recommended")
+        self._page_header(page, "推荐渠道", "精选 API 服务渠道。")
+        panel_outer = tk.Frame(page, bg="#ffffff", highlightthickness=1, highlightbackground="#eceef1")
+        panel_outer.pack(fill="both", expand=True, padx=28, pady=(0, 28))
+        panel = tk.Frame(panel_outer, bg="#ffffff", padx=20, pady=15)
+        panel.pack(fill="both", expand=True)
+        row = tk.Frame(
+            panel,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#e2e5e8",
+            highlightcolor="#e2e5e8",
+            cursor="hand2",
+        )
+        row.pack(fill="x", pady=(0, 10))
+        icon = tk.Label(row, bg="#eef5f2", width=36, height=36)
+        if self.arkapi_icon_image is not None:
+            icon_image = self.arkapi_icon_image
+            scale = max(1, icon_image.width() // 28)
+            if scale > 1:
+                icon_image = icon_image.subsample(scale, scale)
+            icon.configure(image=icon_image, width=36, height=36)
+            icon.image = icon_image
+        icon.pack(side="left", padx=(12, 10), pady=10)
+        text_frame = tk.Frame(row, bg="#ffffff")
+        text_frame.pack(side="left", fill="x", expand=True, pady=9)
+        tk.Label(text_frame, text="AI Ark API    更高性价比    快速稳定    隐私安全    价格透明", bg="#ffffff", fg="#20242b", anchor="w", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        address = tk.Label(text_frame, text=RECOMMENDED_CHANNEL_URL, bg="#ffffff", fg="#2f6f5e", anchor="w", cursor="hand2", font=("Microsoft YaHei UI", 9, "underline"))
+        address.pack(anchor="w", pady=(3, 0))
+        for widget in (row, icon, text_frame, address):
+            widget.bind("<Button-1>", lambda _event: webbrowser.open(RECOMMENDED_CHANNEL_URL, new=2))
 
     def _center_main_window(self) -> None:
         x = max((self.winfo_screenwidth() - WINDOW_WIDTH) // 2, 0)
@@ -3884,7 +3989,7 @@ class CodexConfigApp(tk.Tk):
         self.load_path(default_path)
 
     def current_path(self) -> Path:
-        return Path(self.path_var.get()).expanduser()
+        return canonical_config_path(Path(self.path_var.get()))
 
     def choose_path(self) -> None:
         selected = filedialog.askdirectory(
@@ -3937,6 +4042,8 @@ class CodexConfigApp(tk.Tk):
         self.center_window(picker, 560, 300)
 
     def load_path(self, path: Path) -> None:
+        path = canonical_config_path(path)
+        self.path_var.set(str(path))
         template_created = False
         template_pending = False
         first_use = not (path / "auth.json").exists() and not (path / "config.toml").exists()
