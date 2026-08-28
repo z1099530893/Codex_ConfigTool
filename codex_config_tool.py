@@ -31,6 +31,7 @@ APP_VERSION = "1.4.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
+LATEST_RELEASE_PAGE_URL = f"{PROJECT_URL}/releases/latest"
 RECOMMENDED_CHANNEL_URL = "https://ai.arkapi.top"
 DONATION_THUMBNAIL_IMAGE_NAME = "donation_105.png"
 DONATION_DIALOG_IMAGE_NAME = "donation_210.png"
@@ -69,6 +70,8 @@ MODEL_LIST_TIMEOUT_SECONDS = 8.0
 MODEL_LIST_MAX_BYTES = 2 * 1024 * 1024
 MODEL_LIST_MAX_ITEMS = 5000
 MODEL_ID_MAX_LENGTH = 256
+UPDATE_CHECK_TIMEOUT_SECONDS = 6.0
+CODEX_TRAY_SHELL_SETTLE_SECONDS = 3.0
 CODEX_PACKAGE_PATH_PATTERN = re.compile(
     r"[\\/]WindowsApps[\\/](?P<identity>OpenAI\.Codex)_[^\\/]+__(?P<publisher>[^\\/]+)[\\/]",
     re.IGNORECASE,
@@ -102,6 +105,20 @@ def horizontal_scroll_target(
         return 0.0
     content_width = viewport_width / span
     return min(max(first + pixel_delta / content_width, 0.0), 1.0 - span)
+
+
+def register_appwindow_with_shell(hwnd: int, user32=None) -> None:
+    """Apply taskbar styles and notify Windows about a borderless window's frame change."""
+    if os.name != "nt" and user32 is None:
+        return
+    if user32 is None:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+    extended_style = user32.GetWindowLongW(hwnd, -20)
+    extended_style = (extended_style & ~0x00000080) | 0x00040000
+    user32.SetWindowLongW(hwnd, -20, extended_style)
+    user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)  # NOMOVE | NOSIZE | NOZORDER | FRAMECHANGED
 
 
 def resource_path(name: str) -> Path:
@@ -157,10 +174,61 @@ class CodexRestartError(RuntimeError):
     pass
 
 
+class UpdateCheckError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    version: str
+    page_url: str
+
+
 @dataclass(frozen=True)
 class CodexLaunchResult:
     target: CodexRestartTarget
     action: str
+
+
+def version_tuple(version: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version.strip(), re.IGNORECASE)
+    if not match:
+        raise UpdateCheckError("Release 版本号格式无效。")
+    return tuple(int(part) for part in match.groups())
+
+
+def parse_latest_release_url(release_url: str, current_version: str = APP_VERSION) -> UpdateInfo | None:
+    parsed = urllib.parse.urlsplit(release_url)
+    expected_prefix = "/z1099530893/Codex_ConfigTool/releases/tag/"
+    if parsed.scheme != "https" or parsed.hostname != "github.com" or not parsed.path.startswith(expected_prefix):
+        raise UpdateCheckError("更新服务返回的 Release 地址无效。")
+    tag_name = urllib.parse.unquote(parsed.path[len(expected_prefix) :]).strip("/")
+    if version_tuple(tag_name) <= version_tuple(current_version):
+        return None
+    version = tag_name.removeprefix("v").removeprefix("V")
+    return UpdateInfo(version=version, page_url=f"{PROJECT_URL}/releases/tag/{tag_name}")
+
+
+def fetch_latest_release(timeout: float = UPDATE_CHECK_TIMEOUT_SECONDS) -> UpdateInfo | None:
+    request = urllib.request.Request(
+        LATEST_RELEASE_PAGE_URL,
+        headers={
+            "Accept": "text/html",
+            "User-Agent": f"CodexConfigTool/{APP_VERSION}",
+        },
+        method="HEAD",
+    )
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            release_url = response.geturl()
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            raise UpdateCheckError(f"更新服务返回 HTTP {exc.code}。") from exc
+        release_url = exc.headers.get("Location", "")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise UpdateCheckError("暂时无法连接更新服务。") from exc
+    return parse_latest_release_url(release_url)
 
 
 def list_windows_processes(executable_names: set[str]) -> list[ProcessRecord]:
@@ -378,6 +446,34 @@ def wait_for_processes_exit(process_ids: set[int], timeout: float) -> bool:
     return not any(process_is_running(process_id) for process_id in process_ids)
 
 
+def codex_app_process_ids(processes: list[ProcessRecord], target: CodexRestartTarget) -> set[int]:
+    """Return only desktop host processes belonging to the selected Codex installation."""
+    if target.app_user_model_id:
+        return {
+            process.pid
+            for process in processes
+            if process.executable.name.casefold() in {"chatgpt.exe", "codex.exe"}
+            and "openai.codex_" in str(process.executable).casefold().replace("/", "\\")
+        }
+    target_path = str(target.executable).casefold()
+    return {
+        process.pid
+        for process in processes
+        if str(process.executable).casefold() == target_path
+    }
+
+
+def wait_for_codex_app_exit(target: CodexRestartTarget, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        processes = list_windows_processes({"ChatGPT.exe", "Codex.exe"})
+        if not codex_app_process_ids(processes, target):
+            return True
+        time.sleep(0.1)
+    processes = list_windows_processes({"ChatGPT.exe", "Codex.exe"})
+    return not codex_app_process_ids(processes, target)
+
+
 def activate_codex_window(target: CodexRestartTarget, timeout: float = 12.0) -> bool:
     """Wait for the launched Codex window and bring it back to the foreground."""
     if os.name != "nt":
@@ -437,6 +533,26 @@ def activate_codex_window(target: CodexRestartTarget, timeout: float = 12.0) -> 
     return False
 
 
+def launch_codex_target(target: CodexRestartTarget) -> None:
+    if target.app_user_model_id:
+        # Route packaged-app activation through the user's Windows shell. A direct
+        # COM activation makes Codex a child of this helper, so closing the helper
+        # can also end Codex and its tray controller.
+        subprocess.Popen(
+            ["explorer.exe", f"shell:AppsFolder\\{target.app_user_model_id}"],
+            close_fds=True,
+        )
+        return
+    subprocess.Popen(
+        [str(target.executable)],
+        close_fds=True,
+        creationflags=(
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        ),
+    )
+
+
 def restart_codex_application() -> CodexLaunchResult:
     if os.name != "nt":
         raise CodexRestartError("一键重启目前仅支持 Windows。")
@@ -465,24 +581,15 @@ def restart_codex_application() -> CodexLaunchResult:
             if completed.returncode != 0 and process_is_running(target.root_pid):
                 raise CodexRestartError("无法关闭当前 Codex 进程。")
             wait_for_processes_exit(tree_ids, 2.0)
+        if not wait_for_codex_app_exit(target):
+            raise CodexRestartError("Codex 后台进程尚未完全退出，请稍后重试。")
 
     if action == "restart":
-        time.sleep(0.8)
+        # Electron reuses a fixed tray GUID. Give Explorer time to remove the old
+        # registration before the new process creates its tray controller.
+        time.sleep(CODEX_TRAY_SHELL_SETTLE_SECONDS)
     try:
-        if target.app_user_model_id:
-            subprocess.Popen(
-                ["explorer.exe", f"shell:AppsFolder\\{target.app_user_model_id}"],
-                close_fds=True,
-            )
-        else:
-            subprocess.Popen(
-                [str(target.executable)],
-                close_fds=True,
-                creationflags=(
-                    getattr(subprocess, "DETACHED_PROCESS", 0)
-                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                ),
-            )
+        launch_codex_target(target)
     except OSError as exc:
         raise CodexRestartError(f"Codex 已关闭，但重新启动失败：{exc}") from exc
     if not activate_codex_window(target):
@@ -2204,6 +2311,9 @@ class CodexConfigApp(tk.Tk):
         self.api_key_var = tk.StringVar()
         self.show_key_var = tk.BooleanVar(value=False)
         self._model_fetch_in_progress = False
+        self._update_check_in_progress = False
+        self._available_update: UpdateInfo | None = None
+        self._title_button_drawers: dict[str, object] = {}
         self._current_saved_model = TEMPLATE_MODEL
         self.status_var = tk.StringVar(value="请选择 Codex 配置目录")
         self.current_config_name_var = tk.StringVar(value="未保存配置")
@@ -2262,6 +2372,7 @@ class CodexConfigApp(tk.Tk):
         self.after(50, self._set_appwindow_style)
         self._load_initial_path()
         self.after(150, self.show_onboarding_dialog)
+        self.after(1200, self.check_for_updates_on_startup)
 
     def _load_ui_image(self, name: str) -> tk.PhotoImage | None:
         try:
@@ -2544,9 +2655,9 @@ class CodexConfigApp(tk.Tk):
         close_button.pack(side="right", fill="y")
         minimize_button = self._title_icon_button(title_bar, "minimize", self._minimize_window)
         minimize_button.pack(side="right", fill="y")
-        about_button = self._title_icon_button(title_bar, "about", self.show_about_dialog)
-        about_button.pack(side="right", fill="y")
-        Tooltip(about_button, "关于软件")
+        self.about_button = self._title_icon_button(title_bar, "about", self.show_about_dialog)
+        self.about_button.pack(side="right", fill="y")
+        Tooltip(self.about_button, "关于软件")
         for widget in (title_bar, title_left, title_label):
             widget.bind("<ButtonPress-1>", self._start_window_move)
             widget.bind("<B1-Motion>", self._move_window)
@@ -2625,20 +2736,33 @@ class CodexConfigApp(tk.Tk):
 
     def _title_icon_button(self, parent: tk.Misc, kind: str, command) -> tk.Canvas:
         canvas = tk.Canvas(parent, width=42, height=38, bg="#000000", highlightthickness=0, cursor="hand2")
+        current_background = "#000000"
 
-        def draw(background: str = "#000000") -> None:
-            canvas.configure(bg=background)
+        def draw(background: str | None = None) -> None:
+            nonlocal current_background
+            if background is not None:
+                current_background = background
+            canvas.configure(bg=current_background)
             canvas.delete("all")
             image = self.title_button_images[kind]
             if image is not None:
                 canvas.create_image(21, 19, image=image, anchor="center")
+            if kind == "about" and self._available_update is not None:
+                canvas.create_oval(27, 7, 35, 15, fill="#e53935", outline=current_background, width=2)
 
         hover = "#c42b1c" if kind == "close" else "#292929"
         canvas.bind("<Enter>", lambda _event: draw(hover))
-        canvas.bind("<Leave>", lambda _event: draw())
+        canvas.bind("<Leave>", lambda _event: draw("#000000"))
         canvas.bind("<Button-1>", lambda _event: command())
+        self._title_button_drawers[kind] = draw
         draw()
         return canvas
+
+    def _set_available_update(self, update: UpdateInfo | None) -> None:
+        self._available_update = update
+        draw_about = self._title_button_drawers.get("about")
+        if callable(draw_about):
+            draw_about()
 
     def _draw_eye(self, widget: tk.Label, hidden: bool = False) -> None:
         image = self.eye_off_icon if hidden else self.eye_icon
@@ -3080,14 +3204,16 @@ class CodexConfigApp(tk.Tk):
             import ctypes
 
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+            was_viewable = bool(self.winfo_viewable())
+            if was_viewable:
+                self.withdraw()
+                self.update_idletasks()
+            register_appwindow_with_shell(hwnd, ctypes.windll.user32)
+            if was_viewable:
+                self.deiconify()
+                self.lift()
+                self.focus_force()
             self._install_native_frame_handler(hwnd)
-            window_style = ctypes.windll.user32.GetWindowLongW(hwnd, -16)
-            window_style |= 0x00C00000 | 0x00080000 | 0x00020000
-            ctypes.windll.user32.SetWindowLongW(hwnd, -16, window_style)
-            extended_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            extended_style = (extended_style & ~0x00000080) | 0x00040000
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, extended_style)
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0047)
         except (AttributeError, OSError):
             pass
 
@@ -3886,6 +4012,32 @@ class CodexConfigApp(tk.Tk):
             webbrowser.open_new_tab(PROJECT_URL)
 
         project_label.bind("<Button-1>", open_project)
+        available_update = self._available_update
+        if available_update is None:
+            update_status_var = tk.StringVar(value="")
+            update_button_text = "检查更新"
+        else:
+            update_status_var = tk.StringVar(value=f"发现新版本 {available_update.version}")
+            update_button_text = "前往下载"
+        update_button = ttk.Button(
+            container,
+            text=update_button_text,
+            style="Compact.TButton",
+            width=10,
+        )
+        if available_update is None:
+            update_button.configure(
+                command=lambda: self.start_update_check(
+                    manual=True,
+                    parent=dialog,
+                    status_var=update_status_var,
+                    button=update_button,
+                )
+            )
+        else:
+            update_button.configure(command=lambda: webbrowser.open_new_tab(available_update.page_url))
+        update_button.pack(pady=(1, 5))
+        ttk.Label(container, textvariable=update_status_var, style="Hint.TLabel").pack(pady=(0, 5))
         ttk.Label(
             container,
             text=f"Copyright © 2026 {AUTHOR_NAME}",
@@ -3896,6 +4048,84 @@ class CodexConfigApp(tk.Tk):
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
         self.center_window(dialog, 560)
         dialog.focus_force()
+
+    def check_for_updates_on_startup(self) -> None:
+        self.start_update_check(manual=False)
+
+    def start_update_check(
+        self,
+        manual: bool,
+        parent: tk.Toplevel | None = None,
+        status_var: tk.StringVar | None = None,
+        button: ttk.Button | None = None,
+    ) -> None:
+        if self._update_check_in_progress:
+            if status_var is not None:
+                status_var.set("正在检查更新...")
+            if button is not None:
+                button.configure(state="disabled")
+            self.after(
+                400,
+                lambda: self.start_update_check(manual, parent, status_var, button)
+                if parent is None or parent.winfo_exists()
+                else None,
+            )
+            return
+        self._update_check_in_progress = True
+        if status_var is not None:
+            status_var.set("正在检查更新...")
+        if button is not None:
+            button.configure(state="disabled")
+
+        def worker() -> None:
+            try:
+                update = fetch_latest_release()
+                error = None
+            except UpdateCheckError as exc:
+                update = None
+                error = str(exc)
+            except Exception:
+                update = None
+                error = "检查更新时发生未知错误。"
+            self.after(
+                0,
+                lambda: self._finish_update_check(manual, parent, status_var, button, update, error),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update_check(
+        self,
+        manual: bool,
+        parent: tk.Toplevel | None,
+        status_var: tk.StringVar | None,
+        button: ttk.Button | None,
+        update: UpdateInfo | None,
+        error: str | None,
+    ) -> None:
+        self._update_check_in_progress = False
+        try:
+            if button is not None and button.winfo_exists():
+                button.configure(state="normal")
+        except tk.TclError:
+            button = None
+        if error is not None:
+            if manual and status_var is not None:
+                status_var.set(error)
+            return
+        if update is None:
+            self._set_available_update(None)
+            if manual and status_var is not None:
+                status_var.set(f"当前已是最新版本 {APP_VERSION}")
+            return
+        self._set_available_update(update)
+        if status_var is not None:
+            status_var.set(f"发现新版本 {update.version}")
+        if button is not None:
+            button.configure(
+                text="前往下载",
+                command=lambda: webbrowser.open_new_tab(update.page_url),
+            )
     def ask_config_name(
         self,
         config_dir: Path,

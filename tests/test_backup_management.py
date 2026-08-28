@@ -51,6 +51,51 @@ class BackupManagementTests(unittest.TestCase):
     def test_redact_sensitive_text_hides_api_key(self) -> None:
         self.assertEqual("请求失败：***", app.redact_sensitive_text("请求失败：secret-key", ("secret-key",)))
 
+    def test_release_parser_detects_newer_semantic_version(self) -> None:
+        release_url = f"{app.PROJECT_URL}/releases/tag/v1.5.0"
+        update = app.parse_latest_release_url(release_url, current_version="1.4.0")
+        self.assertEqual("1.5.0", update.version)
+        self.assertEqual(release_url, update.page_url)
+        self.assertIsNone(app.parse_latest_release_url(release_url, current_version="1.5.0"))
+
+    def test_release_parser_rejects_invalid_version(self) -> None:
+        invalid_urls = (
+            "https://example.com/z1099530893/Codex_ConfigTool/releases/tag/v1.5.0",
+            "http://github.com/z1099530893/Codex_ConfigTool/releases/tag/v1.5.0",
+            "https://github.com/other/Codex_ConfigTool/releases/tag/v1.5.0",
+            f"{app.PROJECT_URL}/releases/tag/latest",
+        )
+        for release_url in invalid_urls:
+            with self.subTest(release_url=release_url), self.assertRaises(app.UpdateCheckError):
+                app.parse_latest_release_url(release_url)
+
+    def test_fetch_latest_release_reads_github_release_redirect_without_page_download(self) -> None:
+        calls = {}
+
+        class Opener:
+            def open(self, request, timeout):
+                calls["url"] = request.full_url
+                calls["method"] = request.get_method()
+                calls["timeout"] = timeout
+                calls["accept"] = request.get_header("Accept")
+                raise app.urllib.error.HTTPError(
+                    request.full_url,
+                    302,
+                    "Found",
+                    {"Location": f"{app.PROJECT_URL}/releases/tag/v1.5.0"},
+                    None,
+                )
+
+        with patch.object(app.urllib.request, "build_opener", return_value=Opener()) as builder:
+            update = app.fetch_latest_release(timeout=2.5)
+
+        self.assertEqual("1.5.0", update.version)
+        self.assertEqual(app.LATEST_RELEASE_PAGE_URL, calls["url"])
+        self.assertEqual("HEAD", calls["method"])
+        self.assertEqual(2.5, calls["timeout"])
+        self.assertEqual("text/html", calls["accept"])
+        self.assertIsInstance(builder.call_args.args[0], app._NoRedirectHandler)
+
     def test_classify_config_rejects_permission_conflict(self) -> None:
         self.config_dir.mkdir(parents=True)
         (self.config_dir / "config.toml").write_text(
@@ -89,6 +134,24 @@ class BackupManagementTests(unittest.TestCase):
         self.assertIsNotNone(second)
         app.release_single_instance(second)
 
+    def test_appwindow_registration_notifies_shell_and_restores_window(self) -> None:
+        calls = []
+
+        class User32:
+            def GetWindowLongW(self, hwnd, index):
+                return 0x00000080 if index == -20 else 0
+
+            def SetWindowLongW(self, hwnd, index, value):
+                calls.append(("style", hwnd, index, value))
+
+            def SetWindowPos(self, hwnd, *_args):
+                calls.append(("position", hwnd, _args[-1]))
+
+        app.register_appwindow_with_shell(42, User32())
+
+        self.assertIn(("style", 42, -20, 0x00040000), calls)
+        self.assertIn(("position", 42, 0x0027), calls)
+
     def test_codex_restart_target_uses_packaged_root_process(self) -> None:
         package_root = Path(
             r"C:\Program Files\WindowsApps\OpenAI.Codex_26.814.5517.0_x64__2p2nqsd0c76g0\app"
@@ -122,6 +185,34 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(executable, target.executable)
         self.assertIsNone(target.app_user_model_id)
 
+    def test_codex_app_process_ids_excludes_packaged_cli_children(self) -> None:
+        target = app.CodexRestartTarget(
+            root_pid=100,
+            executable=Path(r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0_x64__publisher\app\ChatGPT.exe"),
+            app_user_model_id="OpenAI.Codex_publisher!App",
+        )
+        processes = [
+            app.ProcessRecord(100, 50, target.executable),
+            app.ProcessRecord(101, 100, target.executable.parent / "Codex.exe"),
+            app.ProcessRecord(102, 100, Path(r"C:\Users\Tester\AppData\Local\OpenAI\Codex\bin\codex.exe")),
+            app.ProcessRecord(200, 50, Path(r"C:\Other\ChatGPT.exe")),
+        ]
+
+        self.assertEqual({100, 101}, app.codex_app_process_ids(processes, target))
+
+    def test_wait_for_codex_app_exit_rechecks_packaged_host_processes(self) -> None:
+        target = app.CodexRestartTarget(
+            root_pid=100,
+            executable=Path(r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0_x64__publisher\app\ChatGPT.exe"),
+            app_user_model_id="OpenAI.Codex_publisher!App",
+        )
+        running = [app.ProcessRecord(100, 50, target.executable)]
+        with (
+            patch.object(app, "list_windows_processes", side_effect=[running, []]),
+            patch.object(app.time, "sleep"),
+        ):
+            self.assertTrue(app.wait_for_codex_app_exit(target, timeout=1.0))
+
     @unittest.skipUnless(os.name == "nt", "Windows Codex launch test")
     def test_codex_launch_starts_store_app_when_not_running(self) -> None:
         target = app.CodexRestartTarget(
@@ -151,8 +242,9 @@ class BackupManagementTests(unittest.TestCase):
             patch.object(app, "list_windows_processes", return_value=processes),
             patch.object(app, "request_windows_close", return_value=1) as request_close,
             patch.object(app, "wait_for_processes_exit", return_value=True) as wait_exit,
+            patch.object(app, "wait_for_codex_app_exit", return_value=True) as wait_app_exit,
             patch.object(app, "activate_codex_window", return_value=True),
-            patch.object(app.time, "sleep"),
+            patch.object(app.time, "sleep") as sleep,
             patch.object(app.subprocess, "Popen") as popen,
             patch.object(app.subprocess, "run") as run,
         ):
@@ -161,6 +253,8 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual("restart", result.action)
         request_close.assert_called_once_with({100})
         wait_exit.assert_called_once_with({100}, 8.0)
+        wait_app_exit.assert_called_once_with(target)
+        sleep.assert_called_once_with(app.CODEX_TRAY_SHELL_SETTLE_SECONDS)
         run.assert_not_called()
         popen.assert_called_once_with(
             [str(target.executable)],
@@ -170,6 +264,22 @@ class BackupManagementTests(unittest.TestCase):
                 | getattr(app.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             ),
         )
+
+    @unittest.skipUnless(os.name == "nt", "Windows Codex restart test")
+    def test_codex_restart_does_not_relaunch_while_host_process_remains(self) -> None:
+        target = app.CodexRestartTarget(root_pid=100, executable=Path(r"C:\Codex\Codex.exe"))
+        processes = [app.ProcessRecord(100, 50, target.executable)]
+        with (
+            patch.object(app, "list_windows_processes", return_value=processes),
+            patch.object(app, "request_windows_close", return_value=1),
+            patch.object(app, "wait_for_processes_exit", return_value=True),
+            patch.object(app, "wait_for_codex_app_exit", return_value=False),
+            patch.object(app.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaises(app.CodexRestartError):
+                app.restart_codex_application()
+
+        popen.assert_not_called()
 
     def test_process_tree_ids_include_nested_codex_children_only(self) -> None:
         processes = [

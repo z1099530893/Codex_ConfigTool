@@ -1,10 +1,14 @@
 # Codex 配置助手
 
-Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库、Tkinter 和 PyInstaller。除非用户主动点击“获取模型”，否则程序不会联网；获取模型时只会将 API Key 发送到用户填写的 Base URL，不会上传到其他服务。
+Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库、Tkinter 和 PyInstaller。启动时会访问 GitHub Release 检查新版本；只有用户主动点击“获取模型”时，才会将 API Key 发送到用户填写的 Base URL，API Key 不会发送到 GitHub 或其他服务。
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版 `CodexConfigTool-v1.4.0.exe`。程序为单文件版本，无需安装。
+前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版。推荐使用 `CodexConfigTool-Setup-v1.4.0.exe` 安装包；仍提供 `CodexConfigTool-Portable-v1.4.0.exe` 便携版，无需安装。
+
+安装包默认安装到当前用户目录，不要求管理员权限，并创建开始菜单入口。桌面快捷方式默认勾选，也可以在安装时取消。卸载时可以选择“保留用户数据”或“完全删除用户数据”；后者只删除配置助手设置和 `.codex\\backups` 配置库，不删除当前配置、API Key、会话或聊天记录。
+
+请勿使用第三方卸载工具清理 Codex 相关“残留”：它可能误将 `%APPDATA%\\Codex` 和 `%LOCALAPPDATA%\\Codex` 识别为配置助手文件。配置助手自身数据目录仅为 `%APPDATA%\\CodexConfigTool`。
 
 ## 功能
 
@@ -22,6 +26,7 @@ Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切�
 - 当前配置页保持连接信息只读，选择模型后自动保存并同步当前配置库记录
 - 官方登录模式和启动新手引导询问
 - 左侧一键启动或重启 Codex，并在执行前进行确认
+- 启动时自动检查 GitHub Release；发现新版本后仅在关于图标显示红点，不弹窗、不自动下载
 - Windows 单实例限制，避免多个窗口交叉修改配置
 - 配置与设置采用原子写入，双文件保存失败时自动恢复原内容
 - 配置签名和搜索信息按文件状态缓存，配置变化后自动失效
@@ -61,7 +66,7 @@ Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切�
 
 ### 一键重启 Codex
 
-左侧“一键重启”可以在配置调整完成后启动或重新启动 Codex，无需手动查找和结束进程。Codex 已运行时，按钮会请求正常关闭，等待其保存“跟随系统”等界面设置后再重新启动；Codex 未运行时，按钮会直接启动已安装的 Codex。只有 Codex 长时间无响应时才会强制结束进程。
+左侧“一键重启”可以在配置调整完成后启动或重新启动 Codex，无需手动查找和结束进程。Codex 已运行时，按钮会请求正常关闭，等待其保存“跟随系统”等界面设置，并在旧进程与系统托盘注册清理完成后再重新启动；Codex 未运行时，按钮会直接启动已安装的 Codex。只有 Codex 长时间无响应时才会强制结束进程。重启后应恢复主窗口、任务栏图标和可用于退出程序的系统托盘图标。
 
 ![一键重启 Codex 确认窗口](docs/images/one-click-restart.png)
 
@@ -75,9 +80,11 @@ Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切�
 
 侧栏“推荐渠道”提供 AI Ark API 服务入口，点击地址即可使用系统默认浏览器打开 `https://ai.arkapi.top`。
 
+![推荐渠道页面](docs/images/recommended-channel.png)
+
 ### 关于软件与赞赏作者
 
-右上角的关于按钮可以查看版本、作者、联系方式和项目地址；点击左下角赞赏码可以查看大图。
+右上角的关于按钮可以查看版本、作者、联系方式和项目地址，并可手动检查软件更新；点击左下角赞赏码可以查看大图。软件启动后会在后台检查 GitHub 最新 Release：发现新版本时只在关于图标右上角显示红点，不弹窗；进入关于窗口后可主动打开下载页。软件不会自动下载、安装或替换 EXE。
 
 <table>
   <tr>
@@ -156,7 +163,19 @@ scripts\build.bat
 .\scripts\build.ps1
 ```
 
-产物位于 `dist/CodexConfigTool.exe`。`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。源码仓库只提交源码、文档、测试、构建脚本和图片资源；`.exe` 应作为 GitHub Release 附件发布，不提交到源码仓库。
+便携版产物位于 `dist/CodexConfigTool.exe`。如需同时生成版本化便携版和安装包，请先安装 Inno Setup 6，再执行：
+
+```bat
+scripts\build_installer.bat
+```
+
+或：
+
+```powershell
+.\scripts\build_installer.ps1
+```
+
+最终发布产物为 `dist/CodexConfigTool-Portable-v<版本>.exe` 和 `dist/CodexConfigTool-Setup-v<版本>.exe`。`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。源码仓库只提交源码、文档、测试、构建脚本和图片资源；生成的 EXE 应作为 GitHub Release 附件发布，不提交到源码仓库。
 
 ## 文件结构
 
@@ -165,6 +184,7 @@ codex_config_tool.py   主程序
 tests/                 标准库测试
 assets/               图片、图标和赞赏码
 scripts/              构建脚本和测试补丁脚本
+packaging/            Inno Setup 安装包定义
 docs/                 项目说明、交接文档和变更记录
 docs/images/          README 使用的界面截图
 CodexConfigTool.spec   PyInstaller 配置
