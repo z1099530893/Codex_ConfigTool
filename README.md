@@ -93,7 +93,7 @@ Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切�
   </tr>
   <tr>
     <td><img src="docs/images/about-dialog.png" alt="关于软件窗口" width="400"></td>
-    <td><img src="docs/images/donation-dialog.png" alt="赞赏作者窗口" width="400"></td>
+    <td><img src="docs/images/donation-dialog-v1.4.0.png" alt="赞赏作者窗口" width="400"></td>
   </tr>
 </table>
 
