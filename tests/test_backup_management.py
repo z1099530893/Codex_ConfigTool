@@ -1,8 +1,10 @@
+import ctypes
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import codex_config_tool as app
@@ -214,6 +216,23 @@ class BackupManagementTests(unittest.TestCase):
             self.assertTrue(app.wait_for_codex_app_exit(target, timeout=1.0))
 
     @unittest.skipUnless(os.name == "nt", "Windows Codex launch test")
+    def test_discover_codex_installation_reads_manifest_application_id(self) -> None:
+        completed = app.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="OpenAI.Codex_2p2nqsd0c76g0!CodexDesktop\n",
+            stderr="",
+        )
+        with patch.object(app.subprocess, "run", return_value=completed) as run:
+            target = app.discover_codex_installation()
+
+        self.assertIsNotNone(target)
+        self.assertEqual("OpenAI.Codex_2p2nqsd0c76g0!CodexDesktop", target.app_user_model_id)
+        command = run.call_args.args[0]
+        self.assertIn("Get-AppxPackageManifest", command[-1])
+        self.assertIn("Get-StartApps", command[-1])
+
+    @unittest.skipUnless(os.name == "nt", "Windows Codex launch test")
     def test_codex_launch_starts_store_app_when_not_running(self) -> None:
         target = app.CodexRestartTarget(
             root_pid=0,
@@ -223,39 +242,124 @@ class BackupManagementTests(unittest.TestCase):
         with (
             patch.object(app, "list_windows_processes", return_value=[]),
             patch.object(app, "discover_codex_installation", return_value=target),
+            patch.object(app, "wait_for_new_codex_process", return_value=True) as wait_for_start,
             patch.object(app, "activate_codex_window", return_value=True),
             patch.object(app.subprocess, "Popen") as popen,
         ):
             result = app.restart_codex_application()
 
         self.assertEqual("start", result.action)
+        wait_for_start.assert_called_once_with(target, set())
         popen.assert_called_once_with(
             ["explorer.exe", "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"],
             close_fds=True,
         )
 
     @unittest.skipUnless(os.name == "nt", "Windows Codex restart test")
-    def test_codex_restart_waits_for_normal_exit_before_launching(self) -> None:
+    def test_request_codex_normal_exit_uses_codex_ctrl_q_accelerator(self) -> None:
         target = app.CodexRestartTarget(root_pid=100, executable=Path(r"C:\Codex\Codex.exe"))
         processes = [app.ProcessRecord(100, 50, target.executable)]
         with (
             patch.object(app, "list_windows_processes", return_value=processes),
-            patch.object(app, "request_windows_close", return_value=1) as request_close,
-            patch.object(app, "wait_for_processes_exit", return_value=True) as wait_exit,
+            patch.object(app, "send_codex_quit_shortcut", return_value=True) as send_quit,
             patch.object(app, "wait_for_codex_app_exit", return_value=True) as wait_app_exit,
+            patch.object(app.subprocess, "run") as run,
+        ):
+            self.assertTrue(app.request_codex_normal_exit(target))
+
+        send_quit.assert_called_once_with({100})
+        wait_app_exit.assert_called_once_with(target, app.CODEX_NORMAL_EXIT_TIMEOUT_SECONDS)
+        run.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Codex restart test")
+    def test_request_codex_normal_exit_does_not_wait_if_focus_verification_fails(self) -> None:
+        target = app.CodexRestartTarget(root_pid=100, executable=Path(r"C:\Codex\Codex.exe"))
+        processes = [app.ProcessRecord(100, 50, target.executable)]
+        with (
+            patch.object(app, "list_windows_processes", return_value=processes),
+            patch.object(app, "send_codex_quit_shortcut", return_value=False),
+            patch.object(app, "wait_for_codex_app_exit") as wait_app_exit,
+        ):
+            self.assertFalse(app.request_codex_normal_exit(target))
+
+        wait_app_exit.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows INPUT ABI test")
+    def test_windows_input_structure_has_native_abi_size(self) -> None:
+        _keyboard_input, input_type = app.windows_keyboard_input_types()
+
+        expected_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28
+        self.assertEqual(expected_size, ctypes.sizeof(input_type))
+
+    def test_codex_tray_guid_only_matches_store_production_package(self) -> None:
+        store_target = app.CodexRestartTarget(
+            root_pid=100,
+            executable=Path(),
+            app_user_model_id="OpenAI.Codex_2p2nqsd0c76g0!App",
+        )
+        other_target = app.CodexRestartTarget(
+            root_pid=100,
+            executable=Path(r"C:\Codex\Codex.exe"),
+        )
+
+        self.assertEqual(app.CODEX_STORE_PROD_TRAY_GUID, app.codex_tray_guid(store_target))
+        self.assertIsNone(app.codex_tray_guid(other_target))
+
+    @unittest.skipUnless(os.name == "nt", "Windows notification area test")
+    def test_remove_stale_codex_tray_registration_deletes_exact_guid(self) -> None:
+        target = app.CodexRestartTarget(
+            root_pid=100,
+            executable=Path(),
+            app_user_model_id="OpenAI.Codex_2p2nqsd0c76g0!App",
+        )
+        captured = {}
+
+        class ShellNotifyIcon:
+            argtypes = None
+            restype = None
+
+            def __call__(self, message, data_pointer):
+                data = data_pointer._obj
+                captured["message"] = message
+                captured["flags"] = data.uFlags
+                captured["guid"] = (
+                    data.guidItem.Data1,
+                    data.guidItem.Data2,
+                    data.guidItem.Data3,
+                    bytes(data.guidItem.Data4),
+                )
+                return True
+
+        shell32 = SimpleNamespace(Shell_NotifyIconW=ShellNotifyIcon())
+        with patch.object(ctypes, "WinDLL", return_value=shell32):
+            self.assertTrue(app.remove_stale_codex_tray_registration(target))
+
+        expected = app.uuid.UUID(app.CODEX_STORE_PROD_TRAY_GUID)
+        self.assertEqual(0x00000002, captured["message"])
+        self.assertEqual(0x00000020, captured["flags"])
+        self.assertEqual(
+            (expected.time_low, expected.time_mid, expected.time_hi_version, expected.bytes[8:]),
+            captured["guid"],
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows Codex restart test")
+    def test_codex_restart_closes_normally_before_launching(self) -> None:
+        target = app.CodexRestartTarget(root_pid=100, executable=Path(r"C:\Codex\Codex.exe"))
+        processes = [app.ProcessRecord(100, 50, target.executable)]
+        with (
+            patch.object(app, "list_windows_processes", return_value=processes),
+            patch.object(app, "discover_codex_installation", return_value=None),
+            patch.object(app, "request_codex_normal_exit", return_value=True) as request_exit,
+            patch.object(app, "wait_for_new_codex_process", return_value=True),
             patch.object(app, "activate_codex_window", return_value=True),
             patch.object(app.time, "sleep") as sleep,
             patch.object(app.subprocess, "Popen") as popen,
-            patch.object(app.subprocess, "run") as run,
         ):
             result = app.restart_codex_application()
 
         self.assertEqual("restart", result.action)
-        request_close.assert_called_once_with({100})
-        wait_exit.assert_called_once_with({100}, 8.0)
-        wait_app_exit.assert_called_once_with(target)
+        request_exit.assert_called_once_with(target)
         sleep.assert_called_once_with(app.CODEX_TRAY_SHELL_SETTLE_SECONDS)
-        run.assert_not_called()
         popen.assert_called_once_with(
             [str(target.executable)],
             close_fds=True,
@@ -266,14 +370,13 @@ class BackupManagementTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(os.name == "nt", "Windows Codex restart test")
-    def test_codex_restart_does_not_relaunch_while_host_process_remains(self) -> None:
+    def test_codex_restart_does_not_relaunch_when_normal_exit_fails(self) -> None:
         target = app.CodexRestartTarget(root_pid=100, executable=Path(r"C:\Codex\Codex.exe"))
         processes = [app.ProcessRecord(100, 50, target.executable)]
         with (
             patch.object(app, "list_windows_processes", return_value=processes),
-            patch.object(app, "request_windows_close", return_value=1),
-            patch.object(app, "wait_for_processes_exit", return_value=True),
-            patch.object(app, "wait_for_codex_app_exit", return_value=False),
+            patch.object(app, "discover_codex_installation", return_value=None),
+            patch.object(app, "request_codex_normal_exit", return_value=False),
             patch.object(app.subprocess, "Popen") as popen,
         ):
             with self.assertRaises(app.CodexRestartError):
@@ -281,15 +384,83 @@ class BackupManagementTests(unittest.TestCase):
 
         popen.assert_not_called()
 
-    def test_process_tree_ids_include_nested_codex_children_only(self) -> None:
-        processes = [
-            app.ProcessRecord(100, 50, Path(r"C:\Codex\ChatGPT.exe")),
-            app.ProcessRecord(101, 100, Path(r"C:\Codex\ChatGPT.exe")),
-            app.ProcessRecord(102, 101, Path(r"C:\Codex\resources\codex.exe")),
-            app.ProcessRecord(200, 50, Path(r"C:\Other\ChatGPT.exe")),
-        ]
+    @unittest.skipUnless(os.name == "nt", "Windows Codex restart test")
+    def test_codex_restart_replaces_guessed_aumid_with_manifest_aumid(self) -> None:
+        target = app.CodexRestartTarget(
+            root_pid=100,
+            executable=Path(r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0_x64__publisher\app\ChatGPT.exe"),
+            app_user_model_id="OpenAI.Codex_2p2nqsd0c76g0!App",
+        )
+        installed = app.CodexRestartTarget(
+            root_pid=0,
+            executable=Path(),
+            app_user_model_id="OpenAI.Codex_2p2nqsd0c76g0!CodexDesktop",
+        )
+        with (
+            patch.object(app, "discover_codex_installation", return_value=installed),
+            patch.object(app, "request_codex_normal_exit", return_value=True) as request_exit,
+            patch.object(app, "remove_stale_codex_tray_registration") as remove_tray,
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "wait_for_new_codex_process", return_value=True),
+            patch.object(app, "activate_codex_window", return_value=True),
+            patch.object(app.time, "sleep"),
+            patch.object(app.subprocess, "Popen") as popen,
+        ):
+            result = app.restart_codex_application(target)
 
-        self.assertEqual({100, 101, 102}, app.process_tree_ids(processes, 100))
+        self.assertEqual("restart", result.action)
+        resolved = request_exit.call_args.args[0]
+        self.assertEqual("OpenAI.Codex_2p2nqsd0c76g0!CodexDesktop", resolved.app_user_model_id)
+        remove_tray.assert_called_once_with(resolved)
+        popen.assert_called_once_with(
+            ["explorer.exe", "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!CodexDesktop"],
+            close_fds=True,
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows Codex launch test")
+    def test_codex_launch_requires_a_new_main_process(self) -> None:
+        target = app.CodexRestartTarget(
+            root_pid=0,
+            executable=Path(),
+            app_user_model_id="OpenAI.Codex_2p2nqsd0c76g0!CodexDesktop",
+        )
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "wait_for_new_codex_process", return_value=False),
+            patch.object(app, "activate_codex_window") as activate,
+            patch.object(app.subprocess, "Popen"),
+        ):
+            with self.assertRaises(app.CodexRestartError):
+                app.launch_codex_application(target, "start")
+
+        activate.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Codex launch test")
+    def test_packaged_launch_falls_back_to_exe_without_no_window_flag(self) -> None:
+        executable = self.root / "ChatGPT.exe"
+        executable.write_bytes(b"")
+        target = app.CodexRestartTarget(
+            root_pid=100,
+            executable=executable,
+            app_user_model_id="OpenAI.Codex_2p2nqsd0c76g0!App",
+        )
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "wait_for_new_codex_process", side_effect=[False, True]),
+            patch.object(app, "activate_codex_window", return_value=True),
+            patch.object(app.subprocess, "Popen") as popen,
+        ):
+            result = app.launch_codex_application(target, "start")
+
+        self.assertIsNone(result.target.app_user_model_id)
+        self.assertEqual(2, popen.call_count)
+        fallback_call = popen.call_args_list[1]
+        self.assertEqual([str(executable)], fallback_call.args[0])
+        self.assertEqual(
+            getattr(app.subprocess, "DETACHED_PROCESS", 0)
+            | getattr(app.subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            fallback_call.kwargs["creationflags"],
+        )
 
     def write_config(
         self,
@@ -321,6 +492,16 @@ class BackupManagementTests(unittest.TestCase):
     def create_profile(self, name: str, provider: str, **kwargs) -> app.BackupRecord:
         self.write_config(self.config_dir, provider, **kwargs)
         return app.create_named_backup(self.config_dir, name)
+
+    def write_native_model_cache(self, entries: list[dict]) -> None:
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        (self.config_dir / app.CODEX_NATIVE_MODEL_CACHE_FILENAME).write_text(
+            json.dumps({"models": entries}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def read_owned_catalog(self, config_dir: Path) -> dict:
+        return json.loads((config_dir / app.MODEL_CATALOG_FILENAME).read_text(encoding="utf-8"))
 
     def test_new_config_is_named_saved_and_applied(self) -> None:
         self.write_config(self.config_dir, "A", "https://a.example.com/v1")
@@ -384,6 +565,218 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(original_mtime, profile_a.path.stat().st_mtime_ns)
         self.assertEqual(original_auth, (profile_a.path / "auth.json").read_bytes())
         self.assertEqual(original_config, (profile_a.path / "config.toml").read_bytes())
+
+    def test_sync_current_to_active_profile_writes_back_codex_model_before_switch(self) -> None:
+        active = self.create_profile("Active", "Provider A", model="deepseek-v4-pro")
+        other = self.create_profile("Other", "Provider B", model="other-model")
+        app.set_active_profile_path(active.path)
+        self.write_config(self.config_dir, "Provider A", model="deepseek-v4-flash")
+
+        synced = app.sync_current_to_active_profile(self.config_dir)
+
+        self.assertEqual(app.normalized_path_key(active.path), app.normalized_path_key(synced.path))
+        self.assertEqual("deepseek-v4-flash", app.read_codex_config(active.path).model)
+        self.assertEqual("other-model", app.read_codex_config(other.path).model)
+
+    def test_reasoning_change_keeps_active_profile_identity_and_syncs_public_default(self) -> None:
+        active = self.create_profile("GPT", "Provider A", model="gpt-test")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        config_path = self.config_dir / "config.toml"
+        lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        config_path.write_text(
+            "".join(app.replace_existing_top_level(lines, "model_reasoning_effort", "medium")),
+            encoding="utf-8",
+        )
+        app.clear_profile_cache()
+
+        resolved = app.resolve_active_profile(self.config_dir)
+        synced = app.sync_current_to_active_profile(self.config_dir)
+
+        self.assertEqual(app.normalized_path_key(active.path), app.normalized_path_key(resolved.path))
+        self.assertEqual(app.normalized_path_key(active.path), app.normalized_path_key(synced.path))
+        synced_lines = (active.path / "config.toml").read_text(encoding="utf-8").splitlines(keepends=True)
+        self.assertEqual("medium", app.get_top_level_value(synced_lines, "model_reasoning_effort"))
+
+    def test_profile_switch_starts_codex_after_projecting_target_when_stopped(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", api_key="key-a")
+        target_profile = self.create_profile("Provider B", "Provider B", api_key="key-b")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        installed = app.CodexRestartTarget(
+            root_pid=0,
+            executable=Path(r"C:\Codex\Codex.exe"),
+        )
+        launch_result = app.CodexLaunchResult(target=installed, action="start")
+        events = []
+        real_sync = app.sync_current_to_active_profile
+        real_restore = app.restore_backup
+
+        def sync_current(config_dir):
+            events.append("sync")
+            return real_sync(config_dir)
+
+        def restore_target(config_dir, backup_dir):
+            events.append("restore")
+            return real_restore(config_dir, backup_dir)
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "discover_codex_installation", return_value=installed),
+            patch.object(app, "sync_current_to_active_profile", side_effect=sync_current),
+            patch.object(app, "restore_backup", side_effect=restore_target),
+            patch.object(
+                app,
+                "launch_codex_application",
+                side_effect=lambda target, action: events.append("launch") or launch_result,
+            ) as launch_codex,
+        ):
+            result = app.switch_saved_profile(self.config_dir, target_profile.path)
+
+        self.assertEqual("start", result.action)
+        self.assertEqual(["sync", "restore", "launch"], events)
+        launch_codex.assert_called_once_with(installed, "start")
+        self.assertEqual(
+            app.normalized_path_key(target_profile.path),
+            app.normalized_path_key(app.active_profile_path(self.config_dir)),
+        )
+        self.assertEqual("Provider B", app.read_codex_config(self.config_dir).provider)
+
+    def test_profile_switch_closes_syncs_projects_and_restarts_in_order(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", api_key="key-a")
+        target_profile = self.create_profile("Provider B", "Provider B", api_key="key-b")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        executable = Path(r"C:\Codex\Codex.exe")
+        running = app.CodexRestartTarget(root_pid=100, executable=executable)
+        records = [app.ProcessRecord(100, 50, executable)]
+        launch_result = app.CodexLaunchResult(target=running, action="restart")
+        events = []
+        real_sync = app.sync_current_to_active_profile
+        real_restore = app.restore_backup
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=records),
+            patch.object(app, "discover_codex_installation", return_value=None),
+            patch.object(app, "request_codex_normal_exit", side_effect=lambda target: events.append("exit") or True),
+            patch.object(app, "remove_stale_codex_tray_registration", side_effect=lambda target: events.append("tray")),
+            patch.object(app, "sync_current_to_active_profile", side_effect=lambda path: events.append("sync") or real_sync(path)),
+            patch.object(app, "restore_backup", side_effect=lambda path, target: events.append("restore") or real_restore(path, target)),
+            patch.object(
+                app,
+                "launch_codex_application",
+                side_effect=lambda target, action: events.append("launch") or launch_result,
+            ),
+        ):
+            result = app.switch_saved_profile(
+                self.config_dir,
+                target_profile.path,
+                allow_running_restart=True,
+            )
+
+        self.assertEqual("restart", result.action)
+        self.assertEqual(["exit", "tray", "sync", "restore", "launch"], events)
+        self.assertEqual("Provider B", app.read_codex_config(self.config_dir).provider)
+
+    def test_profile_switch_requires_confirmation_before_closing_running_codex(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", api_key="key-a")
+        target_profile = self.create_profile("Provider B", "Provider B", api_key="key-b")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        current_before = app.capture_config_files(self.config_dir)
+        active_before = app.capture_config_files(active.path)
+        executable = Path(r"C:\Codex\Codex.exe")
+        records = [app.ProcessRecord(100, 50, executable)]
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=records),
+            patch.object(app, "request_codex_normal_exit") as request_exit,
+            patch.object(app, "sync_current_to_active_profile") as sync_current,
+            patch.object(app, "restore_backup") as restore_target,
+        ):
+            with self.assertRaises(app.ConfigConflictError) as raised:
+                app.switch_saved_profile(self.config_dir, target_profile.path)
+
+        self.assertIn("确认自动重启", str(raised.exception))
+        request_exit.assert_not_called()
+        sync_current.assert_not_called()
+        restore_target.assert_not_called()
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(active_before, app.capture_config_files(active.path))
+
+    def test_profile_switch_restores_original_state_when_projection_fails(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", api_key="key-a", model="a-old")
+        target_profile = self.create_profile("Provider B", "Provider B", api_key="key-b")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        app.update_config_model(self.config_dir / "config.toml", "a-latest")
+        current_before = app.capture_config_files(self.config_dir)
+        active_before = app.capture_config_files(active.path)
+        settings_before = app.SETTINGS_FILE.read_bytes()
+        executable = Path(r"C:\Codex\Codex.exe")
+        running = app.CodexRestartTarget(root_pid=100, executable=executable)
+        records = [app.ProcessRecord(100, 50, executable)]
+        launch_result = app.CodexLaunchResult(target=running, action="restart")
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=records),
+            patch.object(app, "discover_codex_installation", return_value=None),
+            patch.object(app, "request_codex_normal_exit", return_value=True),
+            patch.object(app, "remove_stale_codex_tray_registration"),
+            patch.object(app, "restore_backup", side_effect=app.ConfigConflictError("injected projection failure")),
+            patch.object(app, "launch_codex_application", return_value=launch_result) as relaunch,
+        ):
+            with self.assertRaises(app.ConfigConflictError) as raised:
+                app.switch_saved_profile(
+                    self.config_dir,
+                    target_profile.path,
+                    allow_running_restart=True,
+                )
+
+        self.assertIn("原配置已恢复", str(raised.exception))
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(active_before, app.capture_config_files(active.path))
+        self.assertEqual(settings_before, app.SETTINGS_FILE.read_bytes())
+        relaunch.assert_called_once_with(running, "restart")
+
+    def test_profile_switch_restores_and_relaunches_original_when_target_start_fails(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", api_key="key-a")
+        target_profile = self.create_profile("Provider B", "Provider B", api_key="key-b")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        current_before = app.capture_config_files(self.config_dir)
+        active_before = app.capture_config_files(active.path)
+        settings_before = app.SETTINGS_FILE.read_bytes()
+        executable = Path(r"C:\Codex\Codex.exe")
+        running = app.CodexRestartTarget(root_pid=100, executable=executable)
+        records = [app.ProcessRecord(100, 50, executable)]
+        recovered = app.CodexLaunchResult(target=running, action="restart")
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=records),
+            patch.object(app, "discover_codex_installation", return_value=None),
+            patch.object(app, "request_codex_normal_exit", return_value=True),
+            patch.object(app, "remove_stale_codex_tray_registration"),
+            patch.object(app, "is_codex_application_running", return_value=False),
+            patch.object(
+                app,
+                "launch_codex_application",
+                side_effect=[app.CodexRestartError("injected start failure"), recovered],
+            ) as launch,
+        ):
+            with self.assertRaises(app.CodexRestartError) as raised:
+                app.switch_saved_profile(
+                    self.config_dir,
+                    target_profile.path,
+                    allow_running_restart=True,
+                )
+
+        self.assertIn("原配置已恢复", str(raised.exception))
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(active_before, app.capture_config_files(active.path))
+        self.assertEqual(settings_before, app.SETTINGS_FILE.read_bytes())
+        self.assertEqual(2, launch.call_count)
+        self.assertEqual("restart", launch.call_args_list[1].args[1])
 
     def test_matching_ignores_codex_managed_state_and_profile_name(self) -> None:
         profile = self.create_profile(
@@ -878,6 +1271,534 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual(current_before, app.capture_config_files(self.config_dir))
         self.assertEqual(profile_before, app.capture_config_files(active.path))
 
+    def test_model_display_name_uses_real_model_slug_and_syncs_active_profile(self) -> None:
+        active = self.create_profile("DeepSeek", "DeepSeek", model="deepseek-chat")
+
+        updated = app.save_active_model_display_name(self.config_dir, "DS")
+
+        self.assertEqual(active.path, updated.path)
+        for target in (self.config_dir, active.path):
+            config_text = (target / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "deepseek-chat"', config_text)
+            self.assertIn(
+                f'model_catalog_json = "{app.MODEL_CATALOG_FILENAME}"',
+                config_text,
+            )
+            catalog = json.loads((target / app.MODEL_CATALOG_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual("deepseek-chat", catalog["models"][0]["slug"])
+            self.assertEqual("DS", catalog["models"][0]["display_name"])
+            self.assertEqual("DS", app.read_codex_config(target).model_display_name)
+
+    def test_model_display_name_never_overwrites_external_catalog(self) -> None:
+        self.write_config(self.config_dir, "Provider A", model="deepseek-chat")
+        config_path = self.config_dir / "config.toml"
+        original = 'model_catalog_json = "my-models.json"\n' + config_path.read_text(encoding="utf-8")
+        config_path.write_text(original, encoding="utf-8")
+
+        with self.assertRaises(app.ConfigConflictError):
+            app.save_active_model_display_name(self.config_dir, "DS")
+
+        self.assertEqual(original, config_path.read_text(encoding="utf-8"))
+        self.assertFalse((self.config_dir / app.MODEL_CATALOG_FILENAME).exists())
+
+    def test_model_selection_preserves_full_owned_catalog_in_current_and_profile(self) -> None:
+        active = self.create_profile("DeepSeek", "DeepSeek", model="deepseek-v4-pro")
+        models = ["deepseek-v4-pro", "deepseek-v4-flash"]
+        app.update_owned_model_catalog_models(self.config_dir, models)
+        app.update_owned_model_catalog_models(active.path, models)
+        app.set_active_profile_path(active.path)
+
+        app.save_active_model(self.config_dir, "deepseek-v4-flash")
+
+        for target in (self.config_dir, active.path):
+            self.assertEqual("deepseek-v4-flash", app.read_codex_config(target).model)
+            self.assertEqual(models, app.read_owned_model_catalog_models(target))
+            self.assertIn("model_catalog_json", (target / "config.toml").read_text(encoding="utf-8"))
+
+    def test_model_catalog_exposes_standard_reasoning_choices_instead_of_only_current_value(self) -> None:
+        self.write_config(self.config_dir, "Provider A", model="gpt-5.6-sol")
+        config_path = self.config_dir / "config.toml"
+        lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = app.replace_or_insert_top_level(lines, "model_reasoning_effort", "medium")
+
+        model = app.build_model_catalog("gpt-5.6-sol", "GPT 5.6 Sol", lines)["models"][0]
+
+        self.assertEqual("medium", model["default_reasoning_level"])
+        self.assertEqual(
+            ["low", "medium", "high", "xhigh"],
+            [item["effort"] for item in model["supported_reasoning_levels"]],
+        )
+
+    def test_native_model_slug_reuses_complete_codex_metadata(self) -> None:
+        native_entry = {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "description": "Native Codex model",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "Fast"},
+                {"effort": "high", "description": "Deep"},
+            ],
+            "supported_in_api": True,
+            "priority": 7,
+            "nested_capability": {"enabled": True, "modes": ["text", "image"]},
+        }
+        self.write_config(self.config_dir, "Provider A", model="gpt-5.5")
+        self.write_native_model_cache([native_entry])
+
+        app.update_owned_model_catalog_models(self.config_dir, ["gpt-5.5"])
+
+        self.assertEqual(native_entry, self.read_owned_catalog(self.config_dir)["models"][0])
+
+    def test_gpt_prefix_without_exact_native_slug_uses_generated_metadata(self) -> None:
+        self.write_config(self.config_dir, "Provider A", model="gpt-5.6-custom")
+        self.write_native_model_cache(
+            [{"slug": "gpt-5.5", "display_name": "Native GPT", "priority": 1}]
+        )
+
+        app.update_owned_model_catalog_models(self.config_dir, ["gpt-5.6-custom"])
+
+        entry = self.read_owned_catalog(self.config_dir)["models"][0]
+        self.assertEqual("gpt-5.6-custom", entry["slug"])
+        self.assertEqual("Gpt 5.6 Custom", entry["display_name"])
+        self.assertEqual(1000, entry["priority"])
+
+    def test_native_model_slug_matching_is_case_sensitive(self) -> None:
+        self.write_config(self.config_dir, "Provider A", model="GPT-5.5")
+        self.write_native_model_cache(
+            [{"slug": "gpt-5.5", "display_name": "Native GPT", "priority": 1}]
+        )
+
+        app.update_owned_model_catalog_models(self.config_dir, ["GPT-5.5"])
+
+        entry = self.read_owned_catalog(self.config_dir)["models"][0]
+        self.assertEqual("GPT-5.5", entry["slug"])
+        self.assertEqual(1000, entry["priority"])
+
+    def test_mixed_catalog_uses_native_and_generated_entries(self) -> None:
+        native_entry = {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5 Native",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [{"effort": "high", "description": "Native"}],
+            "priority": 3,
+        }
+        self.write_config(self.config_dir, "Provider A", model="deepseek-v4-flash")
+        self.write_native_model_cache([native_entry])
+
+        app.update_owned_model_catalog_models(
+            self.config_dir,
+            ["gpt-5.5", "deepseek-v4-flash"],
+        )
+
+        entries = {entry["slug"]: entry for entry in self.read_owned_catalog(self.config_dir)["models"]}
+        self.assertEqual(native_entry, entries["gpt-5.5"])
+        self.assertEqual("Deepseek V4 Flash", entries["deepseek-v4-flash"]["display_name"])
+        self.assertEqual(
+            ["low", "medium", "high", "xhigh"],
+            [item["effort"] for item in entries["deepseek-v4-flash"]["supported_reasoning_levels"]],
+        )
+
+    def test_saved_profile_uses_native_cache_from_live_config_root(self) -> None:
+        native_entry = {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5 Native",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [{"effort": "medium", "description": "Native"}],
+            "priority": 5,
+        }
+        active = self.create_profile("Provider A", "Provider A", model="gpt-5.5")
+        self.write_native_model_cache([native_entry])
+        app.set_active_profile_path(active.path)
+
+        app.save_available_models(self.config_dir, ["gpt-5.5"])
+
+        self.assertEqual(native_entry, self.read_owned_catalog(self.config_dir)["models"][0])
+        self.assertEqual(native_entry, self.read_owned_catalog(active.path)["models"][0])
+        self.assertFalse((active.path / app.CODEX_NATIVE_MODEL_CACHE_FILENAME).exists())
+
+    def test_official_provider_removes_owned_catalog_but_preserves_external_catalog(self) -> None:
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = self.config_dir / "config.toml"
+        config_path.write_text(
+            'model_provider = "openai"\n'
+            'model = "gpt-5.5"\n'
+            f'model_catalog_json = "{app.MODEL_CATALOG_FILENAME}"\n',
+            encoding="utf-8",
+        )
+        owned_path = self.config_dir / app.MODEL_CATALOG_FILENAME
+        owned_path.write_text('{"models": [{"slug": "gpt-5.5"}]}\n', encoding="utf-8")
+
+        app.update_owned_model_catalog_models(self.config_dir, ["gpt-5.5"])
+
+        self.assertNotIn("model_catalog_json", config_path.read_text(encoding="utf-8"))
+        self.assertFalse(owned_path.exists())
+
+        external_path = self.config_dir / "user-models.json"
+        external_bytes = b'{"models": [{"slug": "user-model"}]}\n'
+        external_path.write_bytes(external_bytes)
+        config_path.write_text(
+            'model_provider = "openai"\n'
+            'model = "gpt-5.5"\n'
+            'model_catalog_json = "user-models.json"\n',
+            encoding="utf-8",
+        )
+        owned_path.write_text('{"stale": true}\n', encoding="utf-8")
+
+        app.update_owned_model_catalog_models(self.config_dir, ["gpt-5.5"])
+
+        self.assertEqual("user-models.json", app.get_top_level_value(
+            config_path.read_text(encoding="utf-8").splitlines(keepends=True),
+            "model_catalog_json",
+        ))
+        self.assertEqual(external_bytes, external_path.read_bytes())
+        self.assertTrue(owned_path.exists())
+
+    def test_missing_or_malformed_native_cache_falls_back_to_generated_metadata(self) -> None:
+        for malformed in (False, True):
+            with self.subTest(malformed=malformed):
+                case_dir = self.root / f"cache-{malformed}"
+                self.write_config(case_dir, "Provider A", model="gpt-5.6-custom")
+                if malformed:
+                    (case_dir / app.CODEX_NATIVE_MODEL_CACHE_FILENAME).write_text(
+                        "{broken",
+                        encoding="utf-8",
+                    )
+
+                app.update_owned_model_catalog_models(case_dir, ["gpt-5.6-custom"])
+
+                entry = self.read_owned_catalog(case_dir)["models"][0]
+                self.assertEqual("gpt-5.6-custom", entry["slug"])
+                self.assertEqual(1000, entry["priority"])
+
+    def test_switch_upgrades_legacy_reasoning_metadata_in_live_catalog_only(self) -> None:
+        target = self.create_profile("Provider B", "Provider B", model="gpt-5.6-sol")
+        target_config = target.path / "config.toml"
+        target_lines = target_config.read_text(encoding="utf-8").splitlines(keepends=True)
+        target_config.write_text(
+            "".join(app.replace_or_insert_top_level(target_lines, "model_reasoning_effort", "medium")),
+            encoding="utf-8",
+        )
+        legacy_catalog = app.build_model_catalog("gpt-5.6-sol", "GPT 5.6 Sol", target_lines)
+        legacy_model = legacy_catalog["models"][0]
+        legacy_model["supported_reasoning_levels"] = [
+            {"effort": "none", "description": "Disable reasoning"},
+            {"effort": "medium", "description": "Use configured reasoning effort"},
+        ]
+        legacy_bytes = (json.dumps(legacy_catalog, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        (target.path / app.MODEL_CATALOG_FILENAME).write_bytes(legacy_bytes)
+        target_config.write_text(
+            f'model_catalog_json = "{app.MODEL_CATALOG_FILENAME}"\n' + target_config.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        app.apply_saved_profile(self.config_dir, target.path)
+
+        live_catalog = json.loads((self.config_dir / app.MODEL_CATALOG_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(
+            ["low", "medium", "high", "xhigh"],
+            [item["effort"] for item in live_catalog["models"][0]["supported_reasoning_levels"]],
+        )
+        self.assertEqual("medium", live_catalog["models"][0]["default_reasoning_level"])
+        self.assertEqual(legacy_bytes, (target.path / app.MODEL_CATALOG_FILENAME).read_bytes())
+
+    def test_switch_refreshes_native_entry_and_upgrades_only_generated_entry(self) -> None:
+        target = self.create_profile("Mixed", "Provider B", model="gpt-5.5")
+        target_config = target.path / "config.toml"
+        target_lines = target_config.read_text(encoding="utf-8").splitlines(keepends=True)
+        target_config.write_text(
+            "".join(app.replace_or_insert_top_level(target_lines, "model_reasoning_effort", "medium")),
+            encoding="utf-8",
+        )
+        source_catalog = {
+            "models": [
+                app.build_model_catalog("gpt-5.5", "Generated GPT", target_lines)["models"][0],
+                app.build_model_catalog("deepseek-v4-flash", "DeepSeek", target_lines)["models"][0],
+            ]
+        }
+        source_catalog["models"][1]["supported_reasoning_levels"] = [
+            {"effort": "medium", "description": "Legacy"}
+        ]
+        source_bytes = (json.dumps(source_catalog, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        (target.path / app.MODEL_CATALOG_FILENAME).write_bytes(source_bytes)
+        target_config.write_text(
+            f'model_catalog_json = "{app.MODEL_CATALOG_FILENAME}"\n'
+            + target_config.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        native_entry = {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5 Native",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [{"effort": "high", "description": "Native"}],
+            "priority": 2,
+            "native_only": {"value": True},
+        }
+        self.write_native_model_cache([native_entry])
+
+        app.apply_saved_profile(self.config_dir, target.path)
+
+        live_entries = {
+            entry["slug"]: entry
+            for entry in self.read_owned_catalog(self.config_dir)["models"]
+        }
+        self.assertEqual(native_entry, live_entries["gpt-5.5"])
+        self.assertEqual(
+            ["low", "medium", "high", "xhigh"],
+            [
+                item["effort"]
+                for item in live_entries["deepseek-v4-flash"]["supported_reasoning_levels"]
+            ],
+        )
+        self.assertEqual(source_bytes, (target.path / app.MODEL_CATALOG_FILENAME).read_bytes())
+
+    def test_switch_to_official_provider_ignores_historical_owned_catalog(self) -> None:
+        target = self.create_profile("Official", "Provider B", model="gpt-5.5")
+        target_config = target.path / "config.toml"
+        target_config.write_text(
+            'model_provider = "openai"\n'
+            'model = "gpt-5.5"\n'
+            f'model_catalog_json = "{app.MODEL_CATALOG_FILENAME}"\n',
+            encoding="utf-8",
+        )
+        source_catalog_bytes = b'{"models": [{"slug": "gpt-5.5"}]}\n'
+        (target.path / app.MODEL_CATALOG_FILENAME).write_bytes(source_catalog_bytes)
+        self.write_config(self.config_dir, "Provider A", model="deepseek-v4-flash")
+        app.update_owned_model_catalog_models(self.config_dir, ["deepseek-v4-flash"])
+
+        app.apply_saved_profile(self.config_dir, target.path)
+
+        live_config = (self.config_dir / "config.toml").read_text(encoding="utf-8")
+        self.assertEqual("openai", app.read_codex_config(self.config_dir).provider)
+        self.assertNotIn("model_catalog_json", live_config)
+        self.assertFalse((self.config_dir / app.MODEL_CATALOG_FILENAME).exists())
+        self.assertEqual(source_catalog_bytes, (target.path / app.MODEL_CATALOG_FILENAME).read_bytes())
+
+    def test_switch_restores_target_full_catalog_and_default_reasoning_effort(self) -> None:
+        self.write_config(self.config_dir, "DeepSeek", model="deepseek-v4-flash")
+        config_path = self.config_dir / "config.toml"
+        lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        config_path.write_text("".join(app.replace_or_insert_top_level(lines, "model_reasoning_effort", "high")), encoding="utf-8")
+        app.update_owned_model_catalog_models(self.config_dir, ["deepseek-v4-pro", "deepseek-v4-flash"])
+        profile_a = app.create_named_backup(self.config_dir, "DeepSeek")
+
+        self.write_config(self.config_dir, "Sol", model="gpt-5.6-sol")
+        lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        config_path.write_text("".join(app.replace_or_insert_top_level(lines, "model_reasoning_effort", "medium")), encoding="utf-8")
+        target_models = ["gpt-5.5-sol", "gpt-5.6-sol"]
+        app.update_owned_model_catalog_models(self.config_dir, target_models)
+        profile_b = app.create_named_backup(self.config_dir, "Sol")
+
+        app.apply_saved_profile(self.config_dir, profile_a.path)
+        app.set_active_profile_path(profile_a.path)
+        app.apply_saved_profile(self.config_dir, profile_b.path)
+
+        live_lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        self.assertEqual("gpt-5.6-sol", app.read_codex_config(self.config_dir).model)
+        self.assertEqual("medium", app.get_top_level_value(live_lines, "model_reasoning_effort"))
+        self.assertEqual(target_models, app.read_owned_model_catalog_models(self.config_dir))
+        self.assertNotIn("deepseek-v4-flash", app.read_owned_model_catalog_models(self.config_dir))
+
+    def test_switch_to_profile_without_catalog_clears_previous_owned_catalog(self) -> None:
+        source = self.create_profile("With models", "Provider A", model="a-model")
+        app.update_owned_model_catalog_models(self.config_dir, ["a-model", "a-other"])
+        app.update_owned_model_catalog_models(source.path, ["a-model", "a-other"])
+        target = self.create_profile("Without models", "Provider B", model="b-model")
+
+        app.apply_saved_profile(self.config_dir, source.path)
+        app.apply_saved_profile(self.config_dir, target.path)
+
+        text = (self.config_dir / "config.toml").read_text(encoding="utf-8")
+        self.assertNotIn("model_catalog_json", text)
+        self.assertFalse((self.config_dir / app.MODEL_CATALOG_FILENAME).exists())
+
+    def test_save_available_models_rolls_back_current_and_profile_on_failure(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-model")
+        app.set_active_profile_path(active.path)
+        current_before = app.capture_config_files(self.config_dir)
+        profile_before = app.capture_config_files(active.path)
+        real_update = app.update_owned_model_catalog_models
+        calls = 0
+
+        def fail_second(
+            target: Path,
+            models: list[str],
+            native_catalog_dir: Path | None = None,
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected second write failure")
+            real_update(target, models, native_catalog_dir=native_catalog_dir)
+
+        with patch.object(app, "update_owned_model_catalog_models", side_effect=fail_second):
+            with self.assertRaises(OSError):
+                app.save_available_models(self.config_dir, ["a-model", "a-other"])
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(profile_before, app.capture_config_files(active.path))
+
+    def test_save_available_models_rolls_back_on_profile_catalog_conflict(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-model")
+        app.set_active_profile_path(active.path)
+        profile_config = active.path / "config.toml"
+        lines = profile_config.read_text(encoding="utf-8").splitlines(keepends=True)
+        profile_config.write_text(
+            "".join(app.replace_or_insert_top_level(lines, "model_catalog_json", "user-models.json")),
+            encoding="utf-8",
+        )
+        current_before = app.capture_config_files(self.config_dir)
+        profile_before = app.capture_config_files(active.path)
+
+        with self.assertRaises(app.ConfigConflictError):
+            app.save_available_models(
+                self.config_dir,
+                ["a-model", "a-other"],
+                profile_dir=active.path,
+            )
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(profile_before, app.capture_config_files(active.path))
+
+    def test_save_active_model_rolls_back_when_owned_catalog_is_malformed(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-model")
+        app.update_owned_model_catalog_models(self.config_dir, ["a-model", "a-other"])
+        app.update_owned_model_catalog_models(active.path, ["a-model", "a-other"])
+        app.set_active_profile_path(active.path)
+        (active.path / app.MODEL_CATALOG_FILENAME).write_text("{broken", encoding="utf-8")
+        current_before = app.capture_config_files(self.config_dir)
+        profile_before = app.capture_config_files(active.path)
+
+        with self.assertRaises(app.ConfigConflictError):
+            app.save_active_model(self.config_dir, "a-other")
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(profile_before, app.capture_config_files(active.path))
+
+    def test_sync_rolls_back_profile_when_live_owned_catalog_is_malformed(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-model")
+        app.update_owned_model_catalog_models(self.config_dir, ["a-model", "a-other"])
+        app.update_owned_model_catalog_models(active.path, ["a-model", "a-other"])
+        app.set_active_profile_path(active.path)
+        (self.config_dir / app.MODEL_CATALOG_FILENAME).write_text("{broken", encoding="utf-8")
+        profile_before = app.capture_config_files(active.path)
+
+        with self.assertRaises(app.ConfigConflictError):
+            app.sync_current_to_active_profile(self.config_dir)
+
+        self.assertEqual(profile_before, app.capture_config_files(active.path))
+
+    def test_switch_rejects_owned_catalog_missing_default_model_without_live_changes(self) -> None:
+        target = self.create_profile("Provider B", "Provider B", model="b-model")
+        app.update_owned_model_catalog_models(target.path, ["b-model", "b-other"])
+        catalog_path = target.path / app.MODEL_CATALOG_FILENAME
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["models"] = [entry for entry in catalog["models"] if entry["slug"] != "b-model"]
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        current_before = app.capture_config_files(self.config_dir)
+
+        with self.assertRaises(app.ConfigConflictError):
+            app.apply_saved_profile(self.config_dir, target.path)
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+
+    def test_create_profile_persists_available_models_without_inheriting_current_catalog(self) -> None:
+        self.write_config(self.config_dir, "Provider A", model="a-model")
+        app.update_owned_model_catalog_models(self.config_dir, ["a-model", "a-other"])
+
+        saved = app.create_config_profile(
+            self.config_dir,
+            "Provider B",
+            "key-b",
+            "Provider B",
+            "https://provider-b.example.com/v1",
+            "b-model",
+            apply_to_current=True,
+            available_models=["b-model", "b-other"],
+        )
+
+        self.assertEqual(["b-model", "b-other"], app.read_owned_model_catalog_models(saved.path))
+        self.assertEqual(["b-model", "b-other"], app.read_owned_model_catalog_models(self.config_dir))
+        self.assertNotIn("a-other", app.read_owned_model_catalog_models(saved.path))
+
+    def test_openai_profile_ignores_fetched_models_and_keeps_native_config(self) -> None:
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        (self.config_dir / "auth.json").write_text('{"OPENAI_API_KEY": "key-openai"}\n', encoding="utf-8")
+        (self.config_dir / "config.toml").write_text(
+            'model_provider = "openai"\n'
+            'model = "gpt-5.6-sol"\n'
+            'model_reasoning_effort = "medium"\n',
+            encoding="utf-8",
+        )
+        app.save_available_models(self.config_dir, ["gpt-5.6-sol", "gpt-5.6-terra"])
+
+        config_text = (self.config_dir / "config.toml").read_text(encoding="utf-8")
+        self.assertNotIn("model_catalog_json", config_text)
+        self.assertFalse((self.config_dir / app.MODEL_CATALOG_FILENAME).exists())
+        self.assertEqual("gpt-5.6-sol", app.read_codex_config(self.config_dir).model)
+        config_lines = config_text.splitlines(keepends=True)
+        self.assertEqual("medium", app.get_top_level_value(config_lines, "model_reasoning_effort"))
+
+    def test_saved_profile_switch_restores_owned_model_catalog(self) -> None:
+        deepseek = self.create_profile("DeepSeek", "DeepSeek", model="deepseek-chat")
+        app.save_active_model_display_name(self.config_dir, "DS")
+        other = self.create_profile("Other", "Other", model="other-model")
+
+        app.apply_saved_profile(self.config_dir, other.path)
+        self.assertEqual("", app.read_codex_config(self.config_dir).model_display_name)
+        self.assertFalse((self.config_dir / app.MODEL_CATALOG_FILENAME).exists())
+
+        app.apply_saved_profile(self.config_dir, deepseek.path)
+        current = app.read_codex_config(self.config_dir)
+        self.assertEqual("deepseek-chat", current.model)
+        self.assertEqual("DS", current.model_display_name)
+
+    def test_model_display_name_rolls_back_current_and_profile_on_failure(self) -> None:
+        active = self.create_profile("DeepSeek", "DeepSeek", model="deepseek-chat")
+        current_before = app.capture_config_files(self.config_dir)
+        profile_before = app.capture_config_files(active.path)
+        real_write = app.write_text
+
+        def fail_current_config(path: Path, content: str) -> None:
+            if path == self.config_dir / "config.toml" and "model_catalog_json" in content:
+                raise OSError("injected catalog config failure")
+            real_write(path, content)
+
+        with patch.object(app, "write_text", side_effect=fail_current_config):
+            with self.assertRaises(OSError):
+                app.save_active_model_display_name(self.config_dir, "DS")
+
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(profile_before, app.capture_config_files(active.path))
+
+    def test_sync_does_not_overwrite_active_profile_when_provider_identity_changed(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-model")
+        app.set_active_profile_path(active.path)
+        before = app.capture_config_files(active.path)
+        self.write_config(self.config_dir, "Unsaved Provider", model="other-model", api_key="other-key")
+
+        self.assertIsNone(app.sync_current_to_active_profile(self.config_dir))
+        self.assertEqual(before, app.capture_config_files(active.path))
+
+    def test_switch_projects_external_catalog_reference_without_copying_or_deleting_it(self) -> None:
+        target = self.create_profile("External", "Provider B", model="b-model")
+        target_config = target.path / "config.toml"
+        lines = target_config.read_text(encoding="utf-8").splitlines(keepends=True)
+        target_config.write_text(
+            "".join(app.replace_or_insert_top_level(lines, "model_catalog_json", "user-models.json")),
+            encoding="utf-8",
+        )
+        external = target.path / "user-models.json"
+        external.write_text('{"models": [{"slug": "b-model"}]}\n', encoding="utf-8")
+        app.update_owned_model_catalog_models(self.config_dir, ["old-model"])
+
+        app.apply_saved_profile(self.config_dir, target.path)
+
+        live_lines = (self.config_dir / "config.toml").read_text(encoding="utf-8").splitlines(keepends=True)
+        self.assertEqual("user-models.json", app.get_top_level_value(live_lines, "model_catalog_json"))
+        self.assertFalse((self.config_dir / app.MODEL_CATALOG_FILENAME).exists())
+        self.assertTrue(external.exists())
+
     def test_restore_default_preserves_config_auth_and_session_data(self) -> None:
         self.write_config(
             self.config_dir,
@@ -889,6 +1810,7 @@ class BackupManagementTests(unittest.TestCase):
         sessions.mkdir()
         marker = sessions / "keep.txt"
         marker.write_text("keep", encoding="utf-8")
+        app.save_active_model_display_name(self.config_dir, "Model A")
 
         app.restore_default_config(self.config_dir)
 
@@ -901,6 +1823,8 @@ class BackupManagementTests(unittest.TestCase):
         self.assertIn('model_provider = "openai"', config_text)
         self.assertIn('conversation_id = "keep-this"', config_text)
         self.assertIn('window_state = "open"', config_text)
+        self.assertNotIn("model_catalog_json", config_text)
+        self.assertFalse((self.config_dir / app.MODEL_CATALOG_FILENAME).exists())
         self.assertEqual("keep", marker.read_text(encoding="utf-8"))
 
     def test_api_official_api_round_trip_preserves_current_session_identity(self) -> None:
@@ -1008,6 +1932,241 @@ class BackupManagementTests(unittest.TestCase):
     def test_only_explicit_hide_setting_disables_onboarding(self) -> None:
         self.assertFalse(app.should_show_onboarding({app.HIDE_ONBOARDING_KEY: True}))
         self.assertTrue(app.should_show_onboarding({app.HIDE_ONBOARDING_KEY: False}))
+
+
+    def test_pending_active_profile_path_ignores_missing_or_external_paths(self) -> None:
+        active = self.create_profile("Provider A", "Provider A")
+        app.set_pending_active_profile_path(active.path)
+        self.assertEqual(
+            app.normalized_path_key(active.path),
+            app.normalized_path_key(app.pending_active_profile_path(self.config_dir)),
+        )
+
+        app.delete_backups(self.config_dir, [active.path])
+        self.assertIsNone(app.pending_active_profile_path(self.config_dir))
+
+        external = self.root / "external-profile"
+        external.mkdir()
+        app.save_setting_value(app.PENDING_ACTIVE_PROFILE_PATH_KEY, str(external))
+        self.assertIsNone(app.pending_active_profile_path(self.config_dir))
+
+    def test_profile_model_catalog_is_replaced_only_when_saved(self) -> None:
+        saved = app.create_config_profile(
+            self.config_dir,
+            "Provider A",
+            "key-a",
+            "Provider A",
+            "https://provider-a.example.com/v1",
+            "a-old",
+            available_models=["a-old", "a-legacy"],
+        )
+        self.assertEqual(["a-old", "a-legacy"], app.read_owned_model_catalog_models(saved.path))
+
+        edited = app.update_config_profile(
+            self.config_dir,
+            saved.path,
+            "Provider A",
+            "key-a",
+            "Provider A",
+            "https://provider-a.example.com/v1",
+            "a-manual",
+            available_models=["a-new", "a-fast"],
+        )
+
+        self.assertEqual(
+            ["a-manual", "a-new", "a-fast"],
+            app.read_owned_model_catalog_models(edited.path),
+        )
+        self.assertNotIn("a-legacy", app.read_owned_model_catalog_models(edited.path))
+
+    def test_current_page_model_is_readonly_and_profile_editor_has_single_save_action(self) -> None:
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        self.assertIn('self._readonly_field(details, 3, "启动默认模型", self.model_var)', source)
+        self.assertNotIn('text="保存并使用"', source)
+        self.assertNotIn('text="保存并应用"', source)
+        self.assertNotIn("def fetch_models(self)", source)
+        self.assertIn("self.center_window(dialog, 570, 385)", source)
+        self.assertIn('button_row.grid(row=7, column=0, columnspan=3', source)
+        self.assertIn('JM2API_CHANNEL_URL = "https://jm2api.lol"', source)
+        self.assertIn('JM2API_ICON_NAME = "jm2api.png"', source)
+        self.assertIn('add_channel("JM2 API", JM2API_CHANNEL_URL, icon_image=self.jm2api_icon_image)', source)
+
+    def test_switching_current_profile_when_stopped_syncs_then_starts(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-model")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        app.save_active_model(self.config_dir, "a-latest")
+        installed = app.CodexRestartTarget(root_pid=0, executable=Path(r"C:\Codex\Codex.exe"))
+        launch_result = app.CodexLaunchResult(target=installed, action="start")
+        events = []
+        real_sync = app.sync_current_to_active_profile
+        real_restore = app.restore_backup
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "discover_codex_installation", return_value=installed),
+            patch.object(app, "sync_current_to_active_profile", side_effect=lambda path: events.append("sync") or real_sync(path)),
+            patch.object(app, "restore_backup", side_effect=lambda path, target: events.append("restore") or real_restore(path, target)),
+            patch.object(app, "launch_codex_application", side_effect=lambda target, action: events.append("launch") or launch_result),
+        ):
+            result = app.switch_saved_profile(self.config_dir, active.path)
+
+        self.assertEqual("start", result.action)
+        self.assertEqual(["sync", "restore", "launch"], events)
+        self.assertEqual("a-latest", app.read_codex_config(active.path).model)
+        self.assertEqual("a-latest", app.read_codex_config(self.config_dir).model)
+
+    def test_pending_current_profile_when_stopped_applies_without_reverse_sync(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-old")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        edited = app.update_config_profile(
+            self.config_dir,
+            active.path,
+            "Provider A",
+            "key-new",
+            "Provider A",
+            "https://provider-a.example.com/v1",
+            "a-new",
+            apply_to_current=False,
+            available_models=["a-new", "a-other"],
+        )
+        app.set_active_profile_path(edited.path)
+        app.set_pending_active_profile_path(edited.path)
+        installed = app.CodexRestartTarget(root_pid=0, executable=Path(r"C:\Codex\Codex.exe"))
+        launch_result = app.CodexLaunchResult(target=installed, action="start")
+        events = []
+        real_restore = app.restore_backup
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "discover_codex_installation", return_value=installed),
+            patch.object(app, "sync_current_to_active_profile") as sync_current,
+            patch.object(app, "restore_backup", side_effect=lambda path, target: events.append("restore") or real_restore(path, target)),
+            patch.object(app, "launch_codex_application", side_effect=lambda target, action: events.append("launch") or launch_result),
+        ):
+            result = app.switch_saved_profile(self.config_dir, edited.path)
+
+        self.assertEqual("start", result.action)
+        self.assertEqual(["restore", "launch"], events)
+        sync_current.assert_not_called()
+        self.assertEqual("a-new", app.read_codex_config(self.config_dir).model)
+        self.assertEqual(["a-new", "a-other"], app.read_owned_model_catalog_models(self.config_dir))
+        self.assertIsNone(app.pending_active_profile_path(self.config_dir))
+
+    def test_pending_current_profile_when_running_exits_applies_and_restarts(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-old")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        edited = app.update_config_profile(
+            self.config_dir,
+            active.path,
+            "Provider A",
+            "key-new",
+            "Provider A",
+            "https://provider-a.example.com/v1",
+            "a-new",
+            apply_to_current=False,
+        )
+        app.set_active_profile_path(edited.path)
+        app.set_pending_active_profile_path(edited.path)
+        executable = Path(r"C:\Codex\Codex.exe")
+        running = app.CodexRestartTarget(root_pid=100, executable=executable)
+        records = [app.ProcessRecord(100, 50, executable)]
+        launch_result = app.CodexLaunchResult(target=running, action="restart")
+        events = []
+        real_restore = app.restore_backup
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=records),
+            patch.object(app, "discover_codex_installation", return_value=None),
+            patch.object(app, "request_codex_normal_exit", side_effect=lambda target: events.append("exit") or True),
+            patch.object(app, "remove_stale_codex_tray_registration", side_effect=lambda target: events.append("tray")),
+            patch.object(app, "sync_current_to_active_profile") as sync_current,
+            patch.object(app, "restore_backup", side_effect=lambda path, target: events.append("restore") or real_restore(path, target)),
+            patch.object(app, "launch_codex_application", side_effect=lambda target, action: events.append("launch") or launch_result),
+        ):
+            result = app.switch_saved_profile(
+                self.config_dir,
+                edited.path,
+                allow_running_restart=True,
+            )
+
+        self.assertEqual("restart", result.action)
+        self.assertEqual(["exit", "tray", "restore", "launch"], events)
+        sync_current.assert_not_called()
+        self.assertEqual("a-new", app.read_codex_config(self.config_dir).model)
+        self.assertIsNone(app.pending_active_profile_path(self.config_dir))
+
+    def test_switching_away_from_pending_profile_does_not_overwrite_edited_library_copy(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-old")
+        target = self.create_profile("Provider B", "Provider B", model="b-model")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        edited = app.update_config_profile(
+            self.config_dir,
+            active.path,
+            "Provider A",
+            "key-new",
+            "Provider A",
+            "https://provider-a.example.com/v1",
+            "a-new",
+            apply_to_current=False,
+        )
+        app.set_active_profile_path(edited.path)
+        app.set_pending_active_profile_path(edited.path)
+        installed = app.CodexRestartTarget(root_pid=0, executable=Path(r"C:\Codex\Codex.exe"))
+        launch_result = app.CodexLaunchResult(target=installed, action="start")
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "discover_codex_installation", return_value=installed),
+            patch.object(app, "launch_codex_application", return_value=launch_result),
+        ):
+            app.switch_saved_profile(self.config_dir, target.path)
+
+        self.assertEqual("a-new", app.read_codex_config(edited.path).model)
+        self.assertEqual("b-model", app.read_codex_config(self.config_dir).model)
+        self.assertIsNone(app.pending_active_profile_path(self.config_dir))
+
+    def test_pending_profile_projection_failure_restores_live_library_and_settings(self) -> None:
+        active = self.create_profile("Provider A", "Provider A", model="a-old")
+        app.apply_saved_profile(self.config_dir, active.path)
+        app.set_active_profile_path(active.path)
+        edited = app.update_config_profile(
+            self.config_dir,
+            active.path,
+            "Provider A",
+            "key-new",
+            "Provider A",
+            "https://provider-a.example.com/v1",
+            "a-new",
+            apply_to_current=False,
+        )
+        app.set_active_profile_path(edited.path)
+        app.set_pending_active_profile_path(edited.path)
+        current_before = app.capture_config_files(self.config_dir)
+        profile_before = app.capture_config_files(edited.path)
+        settings_before = app.SETTINGS_FILE.read_bytes()
+        installed = app.CodexRestartTarget(root_pid=0, executable=Path(r"C:\Codex\Codex.exe"))
+
+        with (
+            patch.object(app, "list_windows_processes", return_value=[]),
+            patch.object(app, "discover_codex_installation", return_value=installed),
+            patch.object(app, "sync_current_to_active_profile") as sync_current,
+            patch.object(app, "restore_backup", side_effect=app.ConfigConflictError("injected projection failure")),
+        ):
+            with self.assertRaises(app.ConfigConflictError):
+                app.switch_saved_profile(self.config_dir, edited.path)
+
+        sync_current.assert_not_called()
+        self.assertEqual(current_before, app.capture_config_files(self.config_dir))
+        self.assertEqual(profile_before, app.capture_config_files(edited.path))
+        self.assertEqual(settings_before, app.SETTINGS_FILE.read_bytes())
+        self.assertEqual(
+            app.normalized_path_key(edited.path),
+            app.normalized_path_key(app.pending_active_profile_path(self.config_dir)),
+        )
 
 
 if __name__ == "__main__":

@@ -27,3 +27,6 @@ Desktop.ini
 # Codex/runtime local folders
 .agents/
 .codex/
+
+# Misexpanded Windows environment paths created by isolated tests
+%SystemDrive%/

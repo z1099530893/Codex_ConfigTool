@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,10 +35,12 @@ CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
 LATEST_RELEASE_PAGE_URL = f"{PROJECT_URL}/releases/latest"
 RECOMMENDED_CHANNEL_URL = "https://ai.arkapi.top"
+JM2API_CHANNEL_URL = "https://jm2api.lol"
 DONATION_THUMBNAIL_IMAGE_NAME = "donation_105.png"
 DONATION_DIALOG_IMAGE_NAME = "donation_210.png"
 APP_ICON_PNG_NAME = "app_icon.png"
 ARKAPI_ICON_NAME = "arkapi.png"
+JM2API_ICON_NAME = "jm2api.png"
 APP_ICON_ICO_NAME = "app_icon.ico"
 TITLE_ICON_PNG_NAME = "app_icon_title.png"
 TITLE_ABOUT_ICON_NAME = "title_about.png"
@@ -70,8 +74,24 @@ MODEL_LIST_TIMEOUT_SECONDS = 8.0
 MODEL_LIST_MAX_BYTES = 2 * 1024 * 1024
 MODEL_LIST_MAX_ITEMS = 5000
 MODEL_ID_MAX_LENGTH = 256
+MODEL_DISPLAY_NAME_MAX_LENGTH = 80
+MODEL_CATALOG_FILENAME = "codex-config-tool-model-catalog.json"
+CODEX_NATIVE_MODEL_CACHE_FILENAME = "models_cache.json"
+MODEL_CATALOG_REASONING_LEVELS = (
+    ("low", "Low reasoning effort"),
+    ("medium", "Medium reasoning effort"),
+    ("high", "High reasoning effort"),
+    ("xhigh", "Extra high reasoning effort"),
+)
+MANAGED_CONFIG_FILE_NAMES = ("auth.json", "config.toml", MODEL_CATALOG_FILENAME)
 UPDATE_CHECK_TIMEOUT_SECONDS = 6.0
 CODEX_TRAY_SHELL_SETTLE_SECONDS = 3.0
+CODEX_NORMAL_EXIT_TIMEOUT_SECONDS = 15.0
+CODEX_FOREGROUND_SETTLE_SECONDS = 0.4
+CODEX_KEYSTROKE_INTERVAL_SECONDS = 0.04
+CODEX_START_TIMEOUT_SECONDS = 15.0
+CODEX_STORE_PACKAGE_FAMILY = "OpenAI.Codex_2p2nqsd0c76g0"
+CODEX_STORE_PROD_TRAY_GUID = "e5768d8b-6936-4f45-b1ad-4c5fb414cb35"
 CODEX_PACKAGE_PATH_PATTERN = re.compile(
     r"[\\/]WindowsApps[\\/](?P<identity>OpenAI\.Codex)_[^\\/]+__(?P<publisher>[^\\/]+)[\\/]",
     re.IGNORECASE,
@@ -330,44 +350,53 @@ def codex_restart_target(processes: list[ProcessRecord]) -> CodexRestartTarget |
     )
 
 
-def process_tree_ids(processes: list[ProcessRecord], root_pid: int) -> set[int]:
-    descendants = {root_pid}
-    changed = True
-    while changed:
-        changed = False
-        for process in processes:
-            if process.parent_pid in descendants and process.pid not in descendants:
-                descendants.add(process.pid)
-                changed = True
-    return descendants
-
-
 def discover_codex_installation() -> CodexRestartTarget | None:
     """Find a launchable Codex installation when no Codex process is running."""
     if os.name != "nt":
         return None
 
+    app_user_model_id = ""
+    powershell_script = (
+        "$package = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1; "
+        "if ($package) { "
+        "$manifest = Get-AppxPackageManifest -Package $package.PackageFullName "
+        "-ErrorAction SilentlyContinue; "
+        "$application = @($manifest.Package.Applications.Application) | Select-Object -First 1; "
+        "if ($application) { Write-Output ($package.PackageFamilyName + '!' + $application.Id) } "
+        "}; "
+        "if (-not $application) { "
+        "$startApp = Get-StartApps | Where-Object { $_.AppID -like 'OpenAI.Codex_*!*' } | "
+        "Select-Object -First 1; "
+        "if ($startApp) { Write-Output $startApp.AppID } "
+        "}"
+    )
     try:
-        package = subprocess.run(
+        completed = subprocess.run(
             [
                 "powershell.exe",
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "(Get-AppxPackage -Name 'OpenAI.Codex' | Select-Object -First 1).PackageFamilyName",
+                powershell_script,
             ],
             capture_output=True,
             text=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             check=False,
-        ).stdout.strip()
+        )
+        for line in completed.stdout.splitlines():
+            candidate = line.strip()
+            if re.fullmatch(r"OpenAI\.Codex_[^!\s]+![^!\s]+", candidate, re.IGNORECASE):
+                app_user_model_id = candidate
+                break
     except OSError:
-        package = ""
-    if package.casefold().startswith("openai.codex_"):
+        pass
+    if app_user_model_id:
         return CodexRestartTarget(
             root_pid=0,
             executable=Path(),
-            app_user_model_id=f"{package}!App",
+            app_user_model_id=app_user_model_id,
         )
 
     local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
@@ -382,68 +411,6 @@ def discover_codex_installation() -> CodexRestartTarget | None:
         if executable.is_file():
             return CodexRestartTarget(root_pid=0, executable=executable)
     return None
-
-
-def request_windows_close(process_ids: set[int]) -> int:
-    if os.name != "nt" or not process_ids:
-        return 0
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
-    user32.EnumWindows.restype = wintypes.BOOL
-    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
-    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
-    user32.PostMessageW.restype = wintypes.BOOL
-
-    closed = 0
-
-    @callback_type
-    def close_window(hwnd, _lparam):
-        nonlocal closed
-        process_id = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-        if int(process_id.value) in process_ids and user32.PostMessageW(hwnd, 0x0010, 0, 0):
-            closed += 1
-        return True
-
-    user32.EnumWindows(close_window, 0)
-    return closed
-
-
-def process_is_running(process_id: int) -> bool:
-    if os.name != "nt":
-        return False
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
-    process = kernel32.OpenProcess(0x00100000, False, process_id)
-    if not process:
-        return False
-    try:
-        return kernel32.WaitForSingleObject(process, 0) == 0x00000102
-    finally:
-        kernel32.CloseHandle(process)
-
-
-def wait_for_processes_exit(process_ids: set[int], timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not any(process_is_running(process_id) for process_id in process_ids):
-            return True
-        time.sleep(0.1)
-    return not any(process_is_running(process_id) for process_id in process_ids)
 
 
 def codex_app_process_ids(processes: list[ProcessRecord], target: CodexRestartTarget) -> set[int]:
@@ -472,6 +439,225 @@ def wait_for_codex_app_exit(target: CodexRestartTarget, timeout: float = 5.0) ->
         time.sleep(0.1)
     processes = list_windows_processes({"ChatGPT.exe", "Codex.exe"})
     return not codex_app_process_ids(processes, target)
+
+
+def request_codex_normal_exit(target: CodexRestartTarget) -> bool:
+    """Use Codex's own Ctrl+Q menu accelerator, which invokes Electron app.quit()."""
+    processes = list_windows_processes({"ChatGPT.exe", "Codex.exe"})
+    matching_ids = codex_app_process_ids(processes, target)
+    if not matching_ids:
+        return True
+    if not send_codex_quit_shortcut(matching_ids):
+        return False
+    return wait_for_codex_app_exit(target, CODEX_NORMAL_EXIT_TIMEOUT_SECONDS)
+
+
+def windows_keyboard_input_types():
+    """Return ABI-complete Win32 INPUT types; its union size is platform-sensitive."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = (
+            ("dx", wintypes.LONG),
+            ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", wintypes.WPARAM),
+        )
+
+    class KeyboardInput(ctypes.Structure):
+        _fields_ = (
+            ("wVk", wintypes.WORD),
+            ("wScan", wintypes.WORD),
+            ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD),
+            ("dwExtraInfo", wintypes.WPARAM),
+        )
+
+    class HardwareInput(ctypes.Structure):
+        _fields_ = (
+            ("uMsg", wintypes.DWORD),
+            ("wParamL", wintypes.WORD),
+            ("wParamH", wintypes.WORD),
+        )
+
+    class InputUnion(ctypes.Union):
+        _fields_ = (
+            ("mi", MouseInput),
+            ("ki", KeyboardInput),
+            ("hi", HardwareInput),
+        )
+
+    class Input(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = (("type", wintypes.DWORD), ("value", InputUnion))
+
+    return KeyboardInput, Input
+
+
+def send_codex_quit_shortcut(process_ids: set[int]) -> bool:
+    """Focus a verified Codex window and send its registered Ctrl+Q accelerator."""
+    if os.name != "nt" or not process_ids:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = (callback_type, wintypes.LPARAM)
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.GetForegroundWindow.restype = wintypes.HWND
+
+    windows: list[tuple[bool, int]] = []
+
+    @callback_type
+    def collect_window(hwnd, _lparam):
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        if int(process_id.value) in process_ids:
+            windows.append((bool(user32.IsWindowVisible(hwnd)), int(hwnd)))
+        return True
+
+    user32.EnumWindows(collect_window, 0)
+    if not windows:
+        return False
+    windows.sort(reverse=True)
+    hwnd = windows[0][1]
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    if not user32.SetForegroundWindow(hwnd):
+        return False
+
+    # SetForegroundWindow returns before Electron necessarily finishes processing
+    # activation. Wait until the verified Codex window has settled before typing.
+    focus_deadline = time.monotonic() + 2.0
+    while True:
+        foreground_pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(foreground_pid))
+        if int(foreground_pid.value) in process_ids:
+            break
+        if time.monotonic() >= focus_deadline:
+            return False
+        time.sleep(0.05)
+    time.sleep(CODEX_FOREGROUND_SETTLE_SECONDS)
+
+    foreground_pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(foreground_pid))
+    if int(foreground_pid.value) not in process_ids:
+        return False
+
+    KeyboardInput, Input = windows_keyboard_input_types()
+
+    key_up = 0x0002
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+
+    def send_key(virtual_key: int, flags: int = 0) -> bool:
+        key_input = Input(type=1, ki=KeyboardInput(wVk=virtual_key, dwFlags=flags))
+        return user32.SendInput(1, ctypes.byref(key_input), ctypes.sizeof(Input)) == 1
+
+    control_down = False
+    try:
+        control_down = send_key(0x11)  # VK_CONTROL down
+        if not control_down:
+            return False
+        time.sleep(CODEX_KEYSTROKE_INTERVAL_SECONDS)
+        if not send_key(ord("Q")):
+            return False
+        time.sleep(CODEX_KEYSTROKE_INTERVAL_SECONDS)
+        if not send_key(ord("Q"), key_up):
+            return False
+        time.sleep(CODEX_KEYSTROKE_INTERVAL_SECONDS)
+        return send_key(0x11, key_up)
+    finally:
+        if control_down:
+            # A failed partial sequence must never leave Ctrl logically pressed.
+            send_key(0x11, key_up)
+
+
+def codex_tray_guid(target: CodexRestartTarget) -> str | None:
+    app_user_model_id = (target.app_user_model_id or "").casefold()
+    if app_user_model_id.startswith(f"{CODEX_STORE_PACKAGE_FAMILY}!".casefold()):
+        return CODEX_STORE_PROD_TRAY_GUID
+    return None
+
+
+def remove_stale_codex_tray_registration(target: CodexRestartTarget) -> bool:
+    """Remove only Codex's fixed Store tray GUID after its old host has exited."""
+    tray_guid = codex_tray_guid(target)
+    if os.name != "nt" or tray_guid is None:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class Guid(ctypes.Structure):
+        _fields_ = (
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        )
+
+    class NotifyIconData(ctypes.Structure):
+        _fields_ = (
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uID", wintypes.UINT),
+            ("uFlags", wintypes.UINT),
+            ("uCallbackMessage", wintypes.UINT),
+            ("hIcon", wintypes.HANDLE),
+            ("szTip", wintypes.WCHAR * 128),
+            ("dwState", wintypes.DWORD),
+            ("dwStateMask", wintypes.DWORD),
+            ("szInfo", wintypes.WCHAR * 256),
+            ("uTimeoutOrVersion", wintypes.UINT),
+            ("szInfoTitle", wintypes.WCHAR * 64),
+            ("dwInfoFlags", wintypes.DWORD),
+            ("guidItem", Guid),
+            ("hBalloonIcon", wintypes.HANDLE),
+        )
+
+    parsed_guid = uuid.UUID(tray_guid)
+    data = NotifyIconData()
+    data.cbSize = ctypes.sizeof(NotifyIconData)
+    data.uFlags = 0x00000020  # NIF_GUID
+    data.guidItem = Guid(
+        parsed_guid.time_low,
+        parsed_guid.time_mid,
+        parsed_guid.time_hi_version,
+        (ctypes.c_ubyte * 8)(*parsed_guid.bytes[8:]),
+    )
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.Shell_NotifyIconW.argtypes = (
+        wintypes.DWORD,
+        ctypes.POINTER(NotifyIconData),
+    )
+    shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+    return bool(shell32.Shell_NotifyIconW(0x00000002, ctypes.byref(data)))  # NIM_DELETE
+
+
+def wait_for_new_codex_process(
+    target: CodexRestartTarget,
+    previous_process_ids: set[int],
+    timeout: float = CODEX_START_TIMEOUT_SECONDS,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        processes = list_windows_processes({"ChatGPT.exe", "Codex.exe"})
+        if codex_app_process_ids(processes, target) - previous_process_ids:
+            return True
+        time.sleep(0.1)
+    processes = list_windows_processes({"ChatGPT.exe", "Codex.exe"})
+    return bool(codex_app_process_ids(processes, target) - previous_process_ids)
 
 
 def activate_codex_window(target: CodexRestartTarget, timeout: float = 12.0) -> bool:
@@ -553,37 +739,17 @@ def launch_codex_target(target: CodexRestartTarget) -> None:
     )
 
 
-def restart_codex_application() -> CodexLaunchResult:
+def is_codex_application_running() -> bool:
     if os.name != "nt":
-        raise CodexRestartError("一键重启目前仅支持 Windows。")
+        return False
     processes = list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
-    target = codex_restart_target(processes)
-    action = "restart"
-    if target is None:
-        target = discover_codex_installation()
-        if target is None:
-            raise CodexRestartError("没有检测到 Codex 安装，也没有正在运行的 Codex。")
-        action = "start"
+    return codex_restart_target(processes) is not None
 
-    if action == "restart":
-        tree_ids = process_tree_ids(processes, target.root_pid)
-        request_windows_close(tree_ids)
-        # WM_CLOSE gives Codex a chance to persist its in-memory settings.
-        # Even when no top-level window was enumerated, wait before fallback.
-        closed_normally = wait_for_processes_exit(tree_ids, 8.0)
-        if not closed_normally:
-            completed = subprocess.run(
-                ["taskkill", "/PID", str(target.root_pid), "/T", "/F"],
-                capture_output=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                check=False,
-            )
-            if completed.returncode != 0 and process_is_running(target.root_pid):
-                raise CodexRestartError("无法关闭当前 Codex 进程。")
-            wait_for_processes_exit(tree_ids, 2.0)
-        if not wait_for_codex_app_exit(target):
-            raise CodexRestartError("Codex 后台进程尚未完全退出，请稍后重试。")
 
+def launch_codex_application(target: CodexRestartTarget, action: str) -> CodexLaunchResult:
+    previous_processes = list_windows_processes({"ChatGPT.exe", "Codex.exe"})
+    previous_process_ids = codex_app_process_ids(previous_processes, target)
+    launched_target = target
     if action == "restart":
         # Electron reuses a fixed tray GUID. Give Explorer time to remove the old
         # registration before the new process creates its tray controller.
@@ -592,9 +758,48 @@ def restart_codex_application() -> CodexLaunchResult:
         launch_codex_target(target)
     except OSError as exc:
         raise CodexRestartError(f"Codex 已关闭，但重新启动失败：{exc}") from exc
-    if not activate_codex_window(target):
+    if not wait_for_new_codex_process(target, previous_process_ids):
+        if not target.app_user_model_id or not target.executable.is_file():
+            raise CodexRestartError("Windows 已接收启动请求，但没有检测到新的 Codex 主进程。")
+        launched_target = CodexRestartTarget(root_pid=0, executable=target.executable)
+        try:
+            launch_codex_target(launched_target)
+        except OSError as exc:
+            raise CodexRestartError(f"Codex 系统入口启动失败，EXE 回退启动也失败：{exc}") from exc
+        if not wait_for_new_codex_process(launched_target, previous_process_ids):
+            raise CodexRestartError("Windows 系统入口和 EXE 回退均未启动 Codex 主进程。")
+    if not activate_codex_window(launched_target):
         raise CodexRestartError("Codex 进程已启动，但主窗口未显示。请在任务栏或开始菜单中手动打开 Codex。")
-    return CodexLaunchResult(target=target, action=action)
+    return CodexLaunchResult(target=launched_target, action=action)
+
+
+def restart_codex_application(target: CodexRestartTarget | None = None) -> CodexLaunchResult:
+    if os.name != "nt":
+        raise CodexRestartError("重启 Codex 目前仅支持 Windows。")
+    if target is None:
+        processes = list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
+        target = codex_restart_target(processes)
+    action = "restart"
+    if target is None:
+        target = discover_codex_installation()
+        if target is None:
+            raise CodexRestartError("没有检测到 Codex 安装，也没有正在运行的 Codex。")
+        action = "start"
+    else:
+        installed_target = discover_codex_installation()
+        if installed_target is not None and installed_target.app_user_model_id:
+            target = CodexRestartTarget(
+                root_pid=target.root_pid,
+                executable=target.executable,
+                app_user_model_id=installed_target.app_user_model_id,
+            )
+        if not request_codex_normal_exit(target):
+            raise CodexRestartError(
+                "无法让 Codex 正常退出。请从系统托盘右键退出 Codex 后重试。"
+            )
+        remove_stale_codex_tray_registration(target)
+
+    return launch_codex_application(target, action)
 
 
 class Tooltip:
@@ -742,6 +947,7 @@ class CodexConfig:
     provider: str = DEFAULT_PROVIDER
     base_url: str = DEFAULT_BASE_URL
     model: str = TEMPLATE_MODEL
+    model_display_name: str = ""
     auth_exists: bool = False
     config_exists: bool = False
 
@@ -909,6 +1115,423 @@ def parse_model_list(payload: bytes) -> list[str]:
     return sorted(models, key=str.casefold)
 
 
+def validate_model_display_name(display_name: str) -> str:
+    display_name = display_name.strip()
+    if len(display_name) > MODEL_DISPLAY_NAME_MAX_LENGTH:
+        raise ConfigConflictError(f"模型显示名称不能超过 {MODEL_DISPLAY_NAME_MAX_LENGTH} 个字符。")
+    if re.search(r"[\x00-\x1f\x7f]", display_name):
+        raise ConfigConflictError("模型显示名称不能包含控制字符。")
+    return display_name
+
+
+def model_catalog_reference(lines: list[str]) -> tuple[str, str | None]:
+    count = count_top_level_key(lines, "model_catalog_json")
+    if count > 1:
+        raise ConfigConflictError("config.toml 顶层存在多个 model_catalog_json，无法安全修改。")
+    reference = get_top_level_value(lines, "model_catalog_json") if count else None
+    if reference is None:
+        return "none", None
+    if reference == MODEL_CATALOG_FILENAME:
+        return "owned", reference
+    return "external", reference
+
+
+def is_codex_native_provider(lines: list[str]) -> bool:
+    """Whether this config uses Codex's native OpenAI provider metadata."""
+    provider_id = (get_top_level_value(lines, "model_provider") or DEFAULT_PROVIDER).strip()
+    return provider_id == DEFAULT_PROVIDER
+
+
+def model_catalog_context_window(lines: list[str]) -> int:
+    raw_value = get_top_level_value(lines, "model_context_window")
+    try:
+        value = int(raw_value) if raw_value is not None else 128_000
+    except ValueError:
+        value = 128_000
+    return value if 1_024 <= value <= 10_000_000 else 128_000
+
+
+def model_catalog_reasoning_effort(lines: list[str]) -> str:
+    effort = (get_top_level_value(lines, "model_reasoning_effort") or "high").strip().lower()
+    return effort if effort in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"} else "high"
+
+
+def model_catalog_reasoning_metadata(config_lines: list[str]) -> tuple[str, list[dict[str, str]]]:
+    configured_effort = model_catalog_reasoning_effort(config_lines)
+    supported_efforts = {effort for effort, _description in MODEL_CATALOG_REASONING_LEVELS}
+    default_effort = configured_effort if configured_effort in supported_efforts else "medium"
+    reasoning_levels = [
+        {"effort": effort, "description": description}
+        for effort, description in MODEL_CATALOG_REASONING_LEVELS
+    ]
+    return default_effort, reasoning_levels
+
+
+def read_codex_native_model_entries(config_dir: Path) -> dict[str, dict]:
+    """Read Codex's model cache without changing or requiring it."""
+    cache_path = config_dir / CODEX_NATIVE_MODEL_CACHE_FILENAME
+    try:
+        payload = json.loads(read_text(cache_path))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return {}
+    native_models: dict[str, dict] = {}
+    for entry in models:
+        slug = entry.get("slug") if isinstance(entry, dict) else None
+        if isinstance(slug, str) and slug.strip() and slug not in native_models:
+            native_models[slug] = copy.deepcopy(entry)
+    return native_models
+
+
+def normalize_owned_model_catalog_reasoning(
+    catalog: dict,
+    config_lines: list[str],
+    native_models: dict[str, dict] | None = None,
+) -> dict:
+    """Refresh native entries and upgrade only generated entries in memory."""
+    default_effort, reasoning_levels = model_catalog_reasoning_metadata(config_lines)
+    normalized_models = []
+    for original in catalog.get("models", []):
+        slug = original.get("slug") if isinstance(original, dict) else None
+        if isinstance(slug, str) and native_models is not None and slug in native_models:
+            normalized_models.append(copy.deepcopy(native_models[slug]))
+            continue
+        entry = dict(original)
+        entry["default_reasoning_level"] = default_effort
+        entry["supported_reasoning_levels"] = [dict(level) for level in reasoning_levels]
+        normalized_models.append(entry)
+    normalized = dict(catalog)
+    normalized["models"] = normalized_models
+    return normalized
+
+
+def build_model_catalog(
+    model: str,
+    display_name: str,
+    config_lines: list[str],
+    native_models: dict[str, dict] | None = None,
+) -> dict:
+    model = model.strip()
+    if not model:
+        raise ConfigConflictError("Model 不能为空。")
+    if native_models is not None and model in native_models:
+        return {"models": [copy.deepcopy(native_models[model])]}
+    display_name = validate_model_display_name(display_name)
+    context_window = model_catalog_context_window(config_lines)
+    default_effort, reasoning_levels = model_catalog_reasoning_metadata(config_lines)
+    return {
+        "models": [
+            {
+                "slug": model,
+                "display_name": display_name,
+                "description": display_name,
+                "base_instructions": (
+                    "You are Codex, a coding agent. You and the user share the same workspace "
+                    "and collaborate to achieve the user's goals."
+                ),
+                "default_reasoning_level": default_effort,
+                "supported_reasoning_levels": reasoning_levels,
+                "shell_type": "shell_command",
+                "visibility": "list",
+                "supported_in_api": True,
+                "priority": 1000,
+                "supports_reasoning_summaries": True,
+                "default_reasoning_summary": "none",
+                "support_verbosity": False,
+                "truncation_policy": {"mode": "bytes", "limit": 10000},
+                "supports_parallel_tool_calls": False,
+                "supports_image_detail_original": False,
+                "context_window": context_window,
+                "max_context_window": context_window,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text", "image"],
+                "supports_search_tool": False,
+            }
+        ]
+    }
+
+
+def automatic_model_display_name(model: str) -> str:
+    """Create a readable Codex label while preserving the real model slug."""
+    parts = re.split(r"[-_]+", model.strip())
+    return " ".join(part.upper() if re.fullmatch(r"v?\d+(?:\.\d+)*", part, re.IGNORECASE) else part.title() for part in parts if part)
+
+
+def remove_owned_model_catalog_projection(config_dir: Path, lines: list[str]) -> None:
+    """Remove only the catalog owned by this application, preserving external catalogs."""
+    status, _reference = model_catalog_reference(lines)
+    if status == "external":
+        return
+    config_path = config_dir / "config.toml"
+    if status == "owned":
+        write_text(config_path, "".join(remove_top_level_key(lines, "model_catalog_json")))
+    catalog_path = config_dir / MODEL_CATALOG_FILENAME
+    if catalog_path.exists():
+        catalog_path.unlink()
+
+
+def update_owned_model_catalog_models(
+    config_dir: Path,
+    models: list[str],
+    native_catalog_dir: Path | None = None,
+) -> None:
+    config_path = config_dir / "config.toml"
+    if not config_path.exists():
+        raise ConfigConflictError("current config.toml is missing")
+    lines = read_text(config_path).splitlines(keepends=True)
+    status, reference = model_catalog_reference(lines)
+    provider_id = get_top_level_value(lines, "model_provider") or DEFAULT_PROVIDER
+    if is_codex_native_provider(lines):
+        remove_owned_model_catalog_projection(config_dir, lines)
+        return
+    if status == "external":
+        raise ConfigConflictError(f"当前配置已使用用户模型目录 {reference!r}，配置助手不会覆盖")
+    normalized = []
+    seen = set()
+    for model in models:
+        model = model.strip()
+        if model and model not in seen:
+            seen.add(model)
+            normalized.append(model)
+    if not normalized:
+        raise ConfigConflictError("模型列表为空")
+    current_model = (get_top_level_value(lines, "model") or "").strip()
+    if current_model and current_model not in seen:
+        normalized.insert(0, current_model)
+    native_models = read_codex_native_model_entries(native_catalog_dir or config_dir)
+    entries = []
+    for model in normalized:
+        entry = build_model_catalog(
+            model,
+            automatic_model_display_name(model),
+            lines,
+            native_models,
+        )["models"][0]
+        entries.append(entry)
+    catalog_path = config_dir / MODEL_CATALOG_FILENAME
+    write_text(catalog_path, json.dumps({"models": entries}, ensure_ascii=False, indent=2) + "\n")
+    write_text(config_path, "".join(replace_or_insert_top_level(lines, "model_catalog_json", MODEL_CATALOG_FILENAME)))
+
+
+def read_model_display_name(config_dir: Path, model: str | None = None) -> str:
+    config_path = config_dir / "config.toml"
+    catalog_path = config_dir / MODEL_CATALOG_FILENAME
+    if not config_path.exists() or not catalog_path.exists():
+        return ""
+    lines = read_text(config_path).splitlines(keepends=True)
+    status, _reference = model_catalog_reference(lines)
+    if status != "owned":
+        return ""
+    target_model = (model or get_top_level_value(lines, "model") or "").strip()
+    try:
+        catalog = json.loads(read_text(catalog_path))
+    except json.JSONDecodeError:
+        return ""
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return ""
+    for entry in models:
+        if not isinstance(entry, dict) or entry.get("slug") != target_model:
+            continue
+        display_name = entry.get("display_name")
+        if isinstance(display_name, str):
+            try:
+                return validate_model_display_name(display_name)
+            except ConfigConflictError:
+                return ""
+    return ""
+
+
+def read_owned_model_catalog_models(config_dir: Path) -> list[str]:
+    """Read model slugs from the configuration assistant's owned catalog."""
+    config_path = config_dir / "config.toml"
+    catalog_path = config_dir / MODEL_CATALOG_FILENAME
+    if not config_path.exists() or not catalog_path.exists():
+        return []
+    try:
+        lines = read_text(config_path).splitlines(keepends=True)
+        status, _reference = model_catalog_reference(lines)
+        if status != "owned":
+            return []
+        catalog = json.loads(read_text(catalog_path))
+    except (OSError, json.JSONDecodeError):
+        return []
+    entries = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(entries, list):
+        return []
+    models: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        slug = entry.get("slug") if isinstance(entry, dict) else entry
+        if isinstance(slug, str) and slug.strip() and slug.strip() not in seen:
+            slug = slug.strip()
+            seen.add(slug)
+            models.append(slug)
+    return models
+
+
+def read_owned_model_catalog(config_dir: Path) -> dict:
+    """Read and validate the complete catalog owned by this application."""
+    config_path = config_dir / "config.toml"
+    catalog_path = config_dir / MODEL_CATALOG_FILENAME
+    if not config_path.exists():
+        raise ConfigConflictError("当前配置缺少 config.toml。")
+    lines = read_text(config_path).splitlines(keepends=True)
+    status, _reference = model_catalog_reference(lines)
+    if status != "owned" or not catalog_path.exists():
+        raise ConfigConflictError("配置助手模型目录缺失。")
+    try:
+        catalog = json.loads(read_text(catalog_path))
+    except json.JSONDecodeError as exc:
+        raise ConfigConflictError("配置助手模型目录不是有效 JSON。") from exc
+    entries = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise ConfigConflictError("配置助手模型目录缺少 models 列表。")
+    seen: set[str] = set()
+    for entry in entries:
+        slug = entry.get("slug") if isinstance(entry, dict) else None
+        if not isinstance(slug, str) or not slug.strip() or slug.strip() in seen:
+            raise ConfigConflictError("配置助手模型目录包含无效或重复的模型标识。")
+        seen.add(slug.strip())
+    return catalog
+
+
+def ensure_model_in_owned_catalog(
+    config_dir: Path,
+    model: str,
+    native_catalog_dir: Path | None = None,
+) -> None:
+    """Keep a complete owned catalog intact and append a manually entered model if needed."""
+    config_path = config_dir / "config.toml"
+    if not config_path.exists():
+        raise ConfigConflictError("当前配置缺少 config.toml。")
+    lines = read_text(config_path).splitlines(keepends=True)
+    status, _reference = model_catalog_reference(lines)
+    provider_id = get_top_level_value(lines, "model_provider") or DEFAULT_PROVIDER
+    if is_codex_native_provider(lines):
+        remove_owned_model_catalog_projection(config_dir, lines)
+        return
+    if status != "owned":
+        return
+    catalog = read_owned_model_catalog(config_dir)
+    model = model.strip()
+    entries = catalog["models"]
+    native_models = read_codex_native_model_entries(native_catalog_dir or config_dir)
+    matching_index = next(
+        (
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, dict) and entry.get("slug") == model
+        ),
+        None,
+    )
+    if matching_index is not None and model in native_models:
+        native_entry = copy.deepcopy(native_models[model])
+        if entries[matching_index] != native_entry:
+            entries[matching_index] = native_entry
+            write_text(
+                config_dir / MODEL_CATALOG_FILENAME,
+                json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+            )
+        return
+    if matching_index is not None:
+        return
+    entries.append(
+        build_model_catalog(
+            model,
+            automatic_model_display_name(model),
+            lines,
+            native_models,
+        )["models"][0]
+    )
+    write_text(
+        config_dir / MODEL_CATALOG_FILENAME,
+        json.dumps(catalog, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def save_available_models(
+    config_dir: Path,
+    models: list[str],
+    profile_dir: Path | None = None,
+) -> BackupRecord | None:
+    """Persist one provider's complete model list to live and saved configuration atomically."""
+    active = resolve_active_profile(config_dir) if profile_dir is None else backup_record_from_path(profile_dir)
+    current_snapshot = capture_config_files(config_dir)
+    profile_snapshot = capture_config_files(active.path) if active is not None else None
+    try:
+        update_owned_model_catalog_models(config_dir, models, native_catalog_dir=config_dir)
+        if active is not None:
+            update_owned_model_catalog_models(active.path, models, native_catalog_dir=config_dir)
+    except (OSError, ConfigConflictError):
+        restore_config_files(config_dir, current_snapshot)
+        if active is not None and profile_snapshot is not None:
+            restore_config_files(active.path, profile_snapshot)
+        raise
+    finally:
+        clear_profile_cache()
+    return active
+
+
+def update_owned_model_catalog(
+    config_dir: Path,
+    display_name: str,
+    native_catalog_dir: Path | None = None,
+) -> None:
+    config_path = config_dir / "config.toml"
+    if not config_path.exists():
+        raise ConfigConflictError("当前配置缺少 config.toml。")
+    display_name = validate_model_display_name(display_name)
+    lines = read_text(config_path).splitlines(keepends=True)
+    status, reference = model_catalog_reference(lines)
+    provider_id = get_top_level_value(lines, "model_provider") or DEFAULT_PROVIDER
+    if provider_id == DEFAULT_PROVIDER:
+        remove_owned_model_catalog_projection(config_dir, lines)
+        return
+    catalog_path = config_dir / MODEL_CATALOG_FILENAME
+
+    if display_name:
+        if status == "external":
+            raise ConfigConflictError(
+                f"当前配置已使用用户模型目录 {reference!r}，配置助手不会覆盖。"
+            )
+        model = (get_top_level_value(lines, "model") or "").strip()
+        native_models = read_codex_native_model_entries(native_catalog_dir or config_dir)
+        catalog = build_model_catalog(model, display_name, lines, native_models)
+        write_text(catalog_path, json.dumps(catalog, ensure_ascii=False, indent=2) + "\n")
+        lines = replace_or_insert_top_level(lines, "model_catalog_json", MODEL_CATALOG_FILENAME)
+        write_text(config_path, "".join(lines))
+        return
+
+    if status == "owned":
+        write_text(config_path, "".join(remove_top_level_key(lines, "model_catalog_json")))
+    if status != "external" and catalog_path.exists():
+        catalog_path.unlink()
+
+
+def save_active_model_display_name(config_dir: Path, display_name: str) -> BackupRecord | None:
+    """Update only the active model display name and its matching saved profile."""
+    display_name = validate_model_display_name(display_name)
+    active_profile = find_matching_backup(config_dir)
+    current_snapshot = capture_config_files(config_dir)
+    profile_snapshot = capture_config_files(active_profile.path) if active_profile is not None else None
+    try:
+        if active_profile is not None:
+            update_owned_model_catalog(active_profile.path, display_name, native_catalog_dir=config_dir)
+        update_owned_model_catalog(config_dir, display_name, native_catalog_dir=config_dir)
+    except (OSError, ConfigConflictError):
+        restore_config_files(config_dir, current_snapshot)
+        if active_profile is not None and profile_snapshot is not None:
+            restore_config_files(active_profile.path, profile_snapshot)
+        raise
+    finally:
+        clear_profile_cache()
+    return active_profile
+
+
 def fetch_available_models(
     base_url: str,
     api_key: str,
@@ -1020,6 +1643,107 @@ def save_setting_value(key: str, value: object) -> None:
     settings = load_settings()
     settings[key] = value
     write_text(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=2))
+
+
+ACTIVE_PROFILE_PATH_KEY = "active_profile_path"
+PENDING_ACTIVE_PROFILE_PATH_KEY = "pending_active_profile_path"
+
+
+def active_profile_path(config_dir: Path) -> Path | None:
+    value = load_settings().get(ACTIVE_PROFILE_PATH_KEY)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return validate_backup_path(config_dir, Path(value))
+    except OSError:
+        return None
+
+
+def set_active_profile_path(profile_dir: Path | None) -> None:
+    save_setting_value(ACTIVE_PROFILE_PATH_KEY, str(profile_dir.resolve()) if profile_dir is not None else "")
+
+
+def pending_active_profile_path(config_dir: Path) -> Path | None:
+    value = load_settings().get(PENDING_ACTIVE_PROFILE_PATH_KEY)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        profile_dir = validate_backup_path(config_dir, Path(value))
+    except OSError:
+        return None
+    return profile_dir if profile_dir.is_dir() else None
+
+
+def set_pending_active_profile_path(profile_dir: Path | None) -> None:
+    save_setting_value(
+        PENDING_ACTIVE_PROFILE_PATH_KEY,
+        str(profile_dir.resolve()) if profile_dir is not None else "",
+    )
+
+
+def profile_has_pending_apply(config_dir: Path, profile_dir: Path) -> bool:
+    pending = pending_active_profile_path(config_dir)
+    return pending is not None and normalized_path_key(pending) == normalized_path_key(profile_dir)
+
+
+def same_profile_identity(left: BackupSignature | None, right: BackupSignature | None) -> bool:
+    """Compare provider identity while allowing Codex to change model state."""
+    if left is None or right is None:
+        return False
+    return (
+        left.auth_exists == right.auth_exists
+        and left.config_exists == right.config_exists
+        and left.provider_id == right.provider_id
+        and left.provider_name == right.provider_name
+        and left.base_url == right.base_url
+        and left.api_key == right.api_key
+    )
+
+
+def resolve_active_profile(config_dir: Path) -> BackupRecord | None:
+    """Resolve the active profile without writing live state to a different provider."""
+    current_signature = build_backup_signature(config_dir)
+    configured = active_profile_path(config_dir)
+    if configured is not None and configured.is_dir():
+        if same_profile_identity(current_signature, build_backup_signature(configured)):
+            return backup_record_from_path(configured)
+    for record in list_backup_records(config_dir):
+        if same_profile_identity(current_signature, build_backup_signature(record.path)):
+            return record
+    return None
+
+
+def sync_current_to_active_profile(config_dir: Path) -> BackupRecord | None:
+    """Sync public launch defaults and tool-owned catalogs to the matching profile."""
+    active = resolve_active_profile(config_dir)
+    if active is None:
+        return None
+    profile_dir = active.path
+    profile_snapshot = capture_config_files(profile_dir)
+    try:
+        for file_name in ("auth.json", "config.toml"):
+            source = config_dir / file_name
+            target = profile_dir / file_name
+            if source.exists():
+                atomic_copy_file(source, target)
+            elif target.exists():
+                target.unlink()
+        live_config = config_dir / "config.toml"
+        live_lines = read_text(live_config).splitlines(keepends=True) if live_config.exists() else []
+        catalog_status, _reference = model_catalog_reference(live_lines)
+        source_catalog = config_dir / MODEL_CATALOG_FILENAME
+        target_catalog = profile_dir / MODEL_CATALOG_FILENAME
+        if catalog_status == "owned":
+            read_owned_model_catalog(config_dir)
+            atomic_copy_file(source_catalog, target_catalog)
+        elif target_catalog.exists():
+            target_catalog.unlink()
+        clear_profile_cache()
+        set_active_profile_path(profile_dir)
+        return backup_record_from_path(profile_dir)
+    except (OSError, ConfigConflictError):
+        restore_config_files(profile_dir, profile_snapshot)
+        raise
 
 
 def should_show_onboarding(settings: dict) -> bool:
@@ -1388,6 +2112,7 @@ def read_codex_config(config_dir: Path) -> CodexConfig:
         result.provider = get_section_value(lines, provider_section, "name") or provider
         result.base_url = get_section_value(lines, provider_section, "base_url") or DEFAULT_BASE_URL
         result.model = get_top_level_value(lines, "model") or TEMPLATE_MODEL
+        result.model_display_name = read_model_display_name(config_dir, result.model)
 
     return result
 
@@ -1585,7 +2310,7 @@ def validate_new_backup_name(config_dir: Path, name: str) -> str:
 def capture_config_files(config_dir: Path) -> dict[str, bytes | None]:
     return {
         file_name: (config_dir / file_name).read_bytes() if (config_dir / file_name).exists() else None
-        for file_name in ("auth.json", "config.toml")
+        for file_name in MANAGED_CONFIG_FILE_NAMES
     }
 
 
@@ -1602,7 +2327,7 @@ def restore_config_files(config_dir: Path, snapshot: dict[str, bytes | None]) ->
 def copy_config_files(source_dir: Path, target_dir: Path) -> None:
     """Copy the current Codex files before changing only managed fields."""
     target_dir.mkdir(parents=True, exist_ok=True)
-    for file_name in ("auth.json", "config.toml"):
+    for file_name in MANAGED_CONFIG_FILE_NAMES:
         source = source_dir / file_name
         if source.exists():
             shutil.copy2(source, target_dir / file_name)
@@ -1624,7 +2349,7 @@ def create_named_backup(config_dir: Path, name: str | None) -> BackupRecord:
         raise BackupNameConflictError("同一秒内已存在同名配置，请稍后重试或使用新的名称。")
     backup_dir.mkdir(parents=True, exist_ok=False)
     try:
-        for file_name in ("auth.json", "config.toml"):
+        for file_name in MANAGED_CONFIG_FILE_NAMES:
             source = config_dir / file_name
             if source.exists():
                 atomic_copy_file(source, backup_dir / file_name)
@@ -1642,6 +2367,8 @@ def create_config_profile(
     base_url: str,
     model: str,
     apply_to_current: bool = False,
+    model_display_name: str = "",
+    available_models: list[str] | None = None,
 ) -> BackupRecord:
     state, issues = classify_config_for_editing(config_dir)
     if state == "conflict":
@@ -1679,11 +2406,13 @@ def create_config_profile(
             base_url,
             model,
             state,
+            model_display_name,
+            available_models,
         )
         record = backup_record_from_path(profile_dir)
         if apply_to_current:
             restore_backup(config_dir, record.path)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, ConfigConflictError):
         shutil.rmtree(profile_dir, ignore_errors=True)
         if current_snapshot is not None:
             restore_config_files(config_dir, current_snapshot)
@@ -1700,6 +2429,8 @@ def update_config_profile(
     base_url: str,
     model: str,
     apply_to_current: bool = False,
+    model_display_name: str = "",
+    available_models: list[str] | None = None,
 ) -> BackupRecord:
     profile_dir = validate_backup_path(config_dir, profile_dir)
     original_record = backup_record_from_path(profile_dir)
@@ -1736,7 +2467,9 @@ def update_config_profile(
                 provider_name,
                 base_url,
                 model,
+                model_display_name=model_display_name,
                 persist_settings=False,
+                native_catalog_dir=config_dir,
             )
         else:
             save_codex_config(
@@ -1745,13 +2478,24 @@ def update_config_profile(
                 provider_name,
                 base_url,
                 model,
+                model_display_name=model_display_name,
                 persist_settings=False,
+                native_catalog_dir=config_dir,
             )
+        profile_lines = read_text(profile_dir / "config.toml").splitlines(keepends=True)
+        if available_models is not None and not is_codex_native_provider(profile_lines):
+            update_owned_model_catalog_models(
+                profile_dir,
+                available_models,
+                native_catalog_dir=config_dir,
+            )
+        else:
+            ensure_model_in_owned_catalog(profile_dir, model, native_catalog_dir=config_dir)
         if original_record.name != name:
             updated_path = rename_backup(config_dir, profile_dir, name).path
         if apply_to_current:
             restore_backup(config_dir, updated_path)
-    except (OSError, json.JSONDecodeError, BackupNameError):
+    except (OSError, json.JSONDecodeError, BackupNameError, ConfigConflictError):
         if updated_path != profile_dir and updated_path.exists() and not profile_dir.exists():
             updated_path.rename(profile_dir)
         restore_config_files(profile_dir, profile_snapshot)
@@ -1788,10 +2532,16 @@ def rename_backup(config_dir: Path, backup_dir: Path, new_name: str) -> BackupRe
 
 
 def delete_backups(config_dir: Path, backup_dirs: list[Path]) -> None:
-    for backup_dir in backup_dirs:
-        resolved = validate_backup_path(config_dir, backup_dir)
+    resolved_dirs = [validate_backup_path(config_dir, backup_dir) for backup_dir in backup_dirs]
+    pending = pending_active_profile_path(config_dir)
+    for resolved in resolved_dirs:
         if resolved.exists():
             shutil.rmtree(resolved)
+    if pending is not None and any(
+        normalized_path_key(pending) == normalized_path_key(resolved)
+        for resolved in resolved_dirs
+    ):
+        set_pending_active_profile_path(None)
 
 
 def drag_selection_items(
@@ -1824,7 +2574,7 @@ def _profile_provider_fields(profile_dir: Path) -> tuple[str, str, str, str]:
 
 
 def apply_saved_profile(config_dir: Path, backup_dir: Path) -> None:
-    """Merge a saved API profile into live files without replacing session state."""
+    """Restore saved launch defaults without replacing Codex private thread state."""
     backup_dir = validate_backup_path(config_dir, backup_dir)
     source_auth = backup_dir / "auth.json"
     source_config = backup_dir / "config.toml"
@@ -1834,28 +2584,164 @@ def apply_saved_profile(config_dir: Path, backup_dir: Path) -> None:
     try:
         if source_config.exists():
             provider_id, provider_name, base_url, model = _profile_provider_fields(backup_dir)
+            source_lines = read_text(source_config).splitlines(keepends=True)
+            source_catalog_status, source_catalog_reference = model_catalog_reference(source_lines)
+            if provider_id == DEFAULT_PROVIDER and source_catalog_status == "owned":
+                source_catalog_status, source_catalog_reference = "none", None
+            source_reasoning = get_top_level_value(source_lines, "model_reasoning_effort")
+            source_catalog_bytes: bytes | None = None
+            if source_catalog_status == "owned":
+                source_catalog = read_owned_model_catalog(backup_dir)
+                if not any(entry.get("slug") == model for entry in source_catalog["models"]):
+                    raise ConfigConflictError("选择的配置模型不在其模型目录中，无法安全切换。")
+                native_models = read_codex_native_model_entries(config_dir)
+                live_source_catalog = normalize_owned_model_catalog_reasoning(
+                    source_catalog,
+                    source_lines,
+                    native_models,
+                )
+                source_catalog_bytes = (
+                    json.dumps(live_source_catalog, ensure_ascii=False, indent=2) + "\n"
+                ).encode("utf-8")
+
             config_path = config_dir / "config.toml"
             lines = read_text(config_path).splitlines(keepends=True) if config_path.exists() else []
             lines = replace_or_insert_top_level(lines, "model_provider", provider_id)
             lines = replace_or_insert_top_level(lines, "model", model)
             lines = replace_or_insert_top_level(lines, "preferred_auth_method", "apikey")
-            section = f"model_providers.{provider_id}"
-            lines = replace_or_insert_section_value(lines, section, "name", provider_name)
-            lines = replace_or_insert_section_value(lines, section, "base_url", base_url)
+            if source_reasoning is None:
+                lines = remove_top_level_key(lines, "model_reasoning_effort")
+            else:
+                lines = replace_or_insert_top_level(lines, "model_reasoning_effort", source_reasoning)
+            if source_catalog_status == "none":
+                lines = remove_top_level_key(lines, "model_catalog_json")
+            else:
+                lines = replace_or_insert_top_level(
+                    lines,
+                    "model_catalog_json",
+                    source_catalog_reference or MODEL_CATALOG_FILENAME,
+                )
+            if provider_id != DEFAULT_PROVIDER:
+                section = f"model_providers.{provider_id}"
+                lines = replace_or_insert_section_value(lines, section, "name", provider_name)
+                lines = replace_or_insert_section_value(lines, section, "base_url", base_url)
             write_text(config_path, "".join(lines))
+
+            live_catalog = config_dir / MODEL_CATALOG_FILENAME
+            if source_catalog_status == "owned" and source_catalog_bytes is not None:
+                atomic_write_bytes(live_catalog, source_catalog_bytes)
+            elif live_catalog.exists():
+                live_catalog.unlink()
         if source_auth.exists():
             source_data = json.loads(read_text(source_auth))
             if not isinstance(source_data, dict):
                 raise ConfigConflictError("备份 auth.json 不是对象结构，无法应用")
             update_auth_json(config_dir / "auth.json", str(source_data.get("OPENAI_API_KEY", "")))
         save_settings(config_dir)
-    except (OSError, json.JSONDecodeError):
+        clear_profile_cache()
+    except (OSError, json.JSONDecodeError, ConfigConflictError):
         restore_config_files(config_dir, snapshot)
+        clear_profile_cache()
         raise
 
 
 def restore_backup(config_dir: Path, backup_dir: Path) -> None:
     apply_saved_profile(config_dir, backup_dir)
+
+
+def switch_saved_profile(
+    config_dir: Path,
+    backup_dir: Path,
+    allow_running_restart: bool = False,
+) -> CodexLaunchResult:
+    """Close Codex, persist the outgoing profile, project the target, and relaunch."""
+    backup_dir = validate_backup_path(config_dir, backup_dir)
+    processes = list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
+    running_target = codex_restart_target(processes)
+    was_running = running_target is not None
+    if was_running and not allow_running_restart:
+        raise ConfigConflictError("Codex 已开始运行，请重新切换并确认自动重启。")
+
+    launch_target = running_target
+    if running_target is not None:
+        installed_target = discover_codex_installation()
+        if installed_target is not None and installed_target.app_user_model_id:
+            launch_target = CodexRestartTarget(
+                root_pid=running_target.root_pid,
+                executable=running_target.executable,
+                app_user_model_id=installed_target.app_user_model_id,
+            )
+        if not request_codex_normal_exit(launch_target):
+            raise CodexRestartError("无法让 Codex 正常退出，配置尚未切换。")
+        remove_stale_codex_tray_registration(launch_target)
+    else:
+        launch_target = discover_codex_installation()
+        if launch_target is None:
+            raise CodexRestartError("没有检测到 Codex 安装，配置尚未切换。")
+
+    current_snapshot = capture_config_files(config_dir)
+    outgoing = resolve_active_profile(config_dir)
+    outgoing_snapshot = capture_config_files(outgoing.path) if outgoing is not None else None
+    settings_snapshot = SETTINGS_FILE.read_bytes() if SETTINGS_FILE.exists() else None
+    configured_active = active_profile_path(config_dir)
+    pending_active = pending_active_profile_path(config_dir)
+    protect_pending_profile = (
+        configured_active is not None
+        and pending_active is not None
+        and normalized_path_key(configured_active) == normalized_path_key(pending_active)
+    )
+
+    def restore_original_state() -> None:
+        restore_config_files(config_dir, current_snapshot)
+        if outgoing is not None and outgoing_snapshot is not None:
+            restore_config_files(outgoing.path, outgoing_snapshot)
+        if settings_snapshot is None:
+            if SETTINGS_FILE.exists():
+                SETTINGS_FILE.unlink()
+        else:
+            atomic_write_bytes(SETTINGS_FILE, settings_snapshot)
+        clear_profile_cache()
+
+    def relaunch_original_after_rollback() -> str | None:
+        if not was_running:
+            return None
+        try:
+            launch_codex_application(launch_target, "restart")
+        except (CodexRestartError, OSError) as recovery_error:
+            return str(recovery_error) or recovery_error.__class__.__name__
+        return None
+
+    try:
+        if not protect_pending_profile:
+            sync_current_to_active_profile(config_dir)
+        restore_backup(config_dir, backup_dir)
+        set_official_login_mode(config_dir, False)
+        set_active_profile_path(backup_dir)
+        set_pending_active_profile_path(None)
+    except (OSError, json.JSONDecodeError, ConfigConflictError) as exc:
+        restore_original_state()
+        recovery_error = relaunch_original_after_rollback()
+        message = f"切换配置失败，原配置已恢复：{exc}"
+        if recovery_error:
+            message += f"\n\n原 Codex 重新启动失败：{recovery_error}"
+        raise ConfigConflictError(message) from exc
+
+    action = "restart" if was_running else "start"
+    try:
+        return launch_codex_application(launch_target, action)
+    except (CodexRestartError, OSError) as exc:
+        # Never overwrite configuration underneath a partially launched Codex.
+        if is_codex_application_running():
+            raise CodexRestartError(
+                f"配置已切换，但 Codex 启动不完整：{exc}\n\n"
+                "请先从任务栏或系统托盘退出 Codex，再手动启动。"
+            ) from exc
+        restore_original_state()
+        recovery_error = relaunch_original_after_rollback()
+        message = f"Codex 启动失败，原配置已恢复：{exc}"
+        if recovery_error:
+            message += f"\n\n原 Codex 重新启动失败：{recovery_error}"
+        raise CodexRestartError(message) from exc
 
 
 def normalize_provider(provider: str, base_url: str) -> str:
@@ -2022,20 +2908,26 @@ def update_config_model(config_path: Path, model: str) -> None:
 
 
 def save_active_model(config_dir: Path, model: str) -> BackupRecord | None:
-    """Update only the active model and keep its matching saved profile in sync."""
+    """Update the active model without discarding the provider's complete catalog."""
     model = model.strip()
     current_config = read_codex_config(config_dir)
-    active_profile = find_matching_backup(config_dir)
+    active_profile = resolve_active_profile(config_dir)
     if model == current_config.model:
         return active_profile
 
     current_snapshot = capture_config_files(config_dir)
     profile_snapshot = capture_config_files(active_profile.path) if active_profile is not None else None
     try:
+        update_config_model(config_dir / "config.toml", model)
+        ensure_model_in_owned_catalog(config_dir, model, native_catalog_dir=config_dir)
         if active_profile is not None:
             update_config_model(active_profile.path / "config.toml", model)
-        update_config_model(config_dir / "config.toml", model)
-    except OSError:
+            ensure_model_in_owned_catalog(
+                active_profile.path,
+                model,
+                native_catalog_dir=config_dir,
+            )
+    except (OSError, ConfigConflictError):
         restore_config_files(config_dir, current_snapshot)
         if active_profile is not None and profile_snapshot is not None:
             restore_config_files(active_profile.path, profile_snapshot)
@@ -2051,7 +2943,9 @@ def save_codex_config(
     display_name: str,
     base_url: str,
     model: str,
+    model_display_name: str = "",
     persist_settings: bool = True,
+    native_catalog_dir: Path | None = None,
 ) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
     base_url = base_url.strip() or DEFAULT_BASE_URL
@@ -2064,6 +2958,7 @@ def save_codex_config(
     if security_issues:
         raise ConfigConflictError("无法安全保存当前配置：\n\n" + "\n".join(f"- {item}" for item in security_issues))
     config_lines = config_text.splitlines(keepends=True) if config_text else []
+    previous_model = get_top_level_value(config_lines, "model") or ""
     provider_id = get_top_level_value(config_lines, "model_provider") or DEFAULT_PROVIDER
     conflicts = find_config_conflicts(config_lines, provider_id, auth_text)
     if conflicts:
@@ -2077,6 +2972,19 @@ def save_codex_config(
     try:
         update_auth_json(auth_path, api_key)
         update_existing_config_toml(config_path, display_name, base_url, model)
+        catalog_status, _catalog_reference = model_catalog_reference(config_lines)
+        if model_display_name.strip():
+            update_owned_model_catalog(
+                config_dir,
+                model_display_name,
+                native_catalog_dir=native_catalog_dir,
+            )
+        elif catalog_status == "owned":
+            ensure_model_in_owned_catalog(
+                config_dir,
+                model,
+                native_catalog_dir=native_catalog_dir,
+            )
         if persist_settings:
             save_settings(config_dir)
     except OSError:
@@ -2096,6 +3004,7 @@ def restore_default_config(config_dir: Path) -> None:
         lines = replace_or_insert_top_level(lines, "model_provider", DEFAULT_PROVIDER)
         lines = remove_top_level_key(lines, "preferred_auth_method")
         write_text(config_path, "".join(lines))
+        update_owned_model_catalog(config_dir, "")
         save_settings(config_dir)
     except (OSError, json.JSONDecodeError):
         restore_config_files(config_dir, snapshot)
@@ -2120,6 +3029,7 @@ def create_custom_template_config(
         else:
             update_auth_json(auth_path, api_key)
         write_text(config_dir / "config.toml", build_custom_template_config_toml(provider_name, base_url, model))
+        update_owned_model_catalog(config_dir, "")
         if persist_settings:
             save_settings(config_dir)
     except OSError:
@@ -2133,7 +3043,9 @@ def save_custom_provider_config(
     provider_name: str,
     base_url: str,
     model: str,
+    model_display_name: str = "",
     persist_settings: bool = True,
+    native_catalog_dir: Path | None = None,
 ) -> None:
     """Add a custom Provider while preserving unrelated current settings."""
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -2147,9 +3059,15 @@ def save_custom_provider_config(
             model,
             persist_settings=persist_settings,
         )
+        update_owned_model_catalog(
+            config_dir,
+            model_display_name,
+            native_catalog_dir=native_catalog_dir,
+        )
         return
 
     lines = read_text(config_path).splitlines(keepends=True)
+    previous_model = get_top_level_value(lines, "model") or ""
     lines = replace_or_insert_top_level(lines, "model_provider", TEMPLATE_PROVIDER_ID)
     lines = replace_or_insert_top_level(lines, "model", model.strip() or TEMPLATE_MODEL)
     provider_section = f"model_providers.{TEMPLATE_PROVIDER_ID}"
@@ -2161,6 +3079,19 @@ def save_custom_provider_config(
 
     update_auth_json(config_dir / "auth.json", api_key)
     write_text(config_path, "".join(lines))
+    catalog_status, _catalog_reference = model_catalog_reference(lines)
+    if model_display_name.strip():
+        update_owned_model_catalog(
+            config_dir,
+            model_display_name,
+            native_catalog_dir=native_catalog_dir,
+        )
+    elif catalog_status == "owned":
+        ensure_model_in_owned_catalog(
+            config_dir,
+            model,
+            native_catalog_dir=native_catalog_dir,
+        )
     if persist_settings:
         save_settings(config_dir)
 
@@ -2173,9 +3104,18 @@ def create_profile_from_current_config(
     base_url: str,
     model: str,
     state: str,
+    model_display_name: str = "",
+    available_models: list[str] | None = None,
 ) -> None:
-    """Clone the current files, then update only the requested Provider fields."""
+    """Clone safe current settings without inheriting another provider's model catalog."""
     copy_config_files(source_dir, profile_dir)
+    profile_config = profile_dir / "config.toml"
+    if profile_config.exists():
+        profile_lines = read_text(profile_config).splitlines(keepends=True)
+        write_text(profile_config, "".join(remove_top_level_key(profile_lines, "model_catalog_json")))
+    owned_catalog = profile_dir / MODEL_CATALOG_FILENAME
+    if owned_catalog.exists():
+        owned_catalog.unlink()
     if state == "editable":
         save_codex_config(
             profile_dir,
@@ -2183,7 +3123,9 @@ def create_profile_from_current_config(
             provider_name,
             base_url,
             model,
+            model_display_name=model_display_name,
             persist_settings=False,
+            native_catalog_dir=source_dir,
         )
     else:
         save_custom_provider_config(
@@ -2192,7 +3134,15 @@ def create_profile_from_current_config(
             provider_name,
             base_url,
             model,
+            model_display_name=model_display_name,
             persist_settings=False,
+            native_catalog_dir=source_dir,
+        )
+    if available_models is not None:
+        update_owned_model_catalog_models(
+            profile_dir,
+            available_models,
+            native_catalog_dir=source_dir,
         )
 
 
@@ -2228,6 +3178,7 @@ def save_config_profile(
     model: str,
     state: str,
     config_name: str | None,
+    model_display_name: str = "",
 ) -> BackupResult:
     signature = build_requested_signature(config_dir, api_key, provider_name, base_url, model, state)
     existing = find_matching_backup(config_dir, signature)
@@ -2237,7 +3188,7 @@ def save_config_profile(
             if state == "needs_template":
                 restore_backup(config_dir, existing.path)
             else:
-                save_codex_config(config_dir, api_key, provider_name, base_url, model)
+                save_codex_config(config_dir, api_key, provider_name, base_url, model, model_display_name=model_display_name)
         except (OSError, json.JSONDecodeError):
             restore_config_files(config_dir, snapshot)
             raise
@@ -2249,9 +3200,9 @@ def save_config_profile(
     snapshot = capture_config_files(config_dir)
     try:
         if state == "needs_template":
-            save_custom_provider_config(config_dir, api_key, provider_name, base_url, model)
+            save_custom_provider_config(config_dir, api_key, provider_name, base_url, model, model_display_name=model_display_name)
         else:
-            save_codex_config(config_dir, api_key, provider_name, base_url, model)
+            save_codex_config(config_dir, api_key, provider_name, base_url, model, model_display_name=model_display_name)
         record = create_named_backup(config_dir, config_name)
     except (OSError, json.JSONDecodeError, BackupNameError):
         restore_config_files(config_dir, snapshot)
@@ -2308,13 +3259,12 @@ class CodexConfigApp(tk.Tk):
         self.provider_var = tk.StringVar(value=DEFAULT_PROVIDER)
         self.base_url_var = tk.StringVar(value=DEFAULT_BASE_URL)
         self.model_var = tk.StringVar(value=TEMPLATE_MODEL)
+        self.model_display_name_var = tk.StringVar()
         self.api_key_var = tk.StringVar()
         self.show_key_var = tk.BooleanVar(value=False)
-        self._model_fetch_in_progress = False
         self._update_check_in_progress = False
         self._available_update: UpdateInfo | None = None
         self._title_button_drawers: dict[str, object] = {}
-        self._current_saved_model = TEMPLATE_MODEL
         self.status_var = tk.StringVar(value="请选择 Codex 配置目录")
         self.current_config_name_var = tk.StringVar(value="未保存配置")
         self.current_config_prefix_var = tk.StringVar(value="")
@@ -2322,6 +3272,7 @@ class CodexConfigApp(tk.Tk):
         self.official_status_var = tk.StringVar(value="当前未使用官方登录模式")
         self.profile_search_var = tk.StringVar()
         self.profile_sort_desc = False
+        self.profile_switch_in_progress = False
         self.pages: dict[str, tk.Frame] = {}
         self.nav_items: dict[str, tuple[tk.Frame, tk.Label, tk.Button]] = {}
         self.active_page = "current"
@@ -2343,6 +3294,7 @@ class CodexConfigApp(tk.Tk):
         self.eye_off_icon = self._load_ui_image(EYE_OFF_ICON_NAME)
         self.about_mark_image = self._load_ui_image(ABOUT_MARK_PNG_NAME)
         self.arkapi_icon_image = self._load_ui_image(ARKAPI_ICON_NAME)
+        self.jm2api_icon_image = self._load_ui_image(JM2API_ICON_NAME)
         try:
             self.iconbitmap(str(resource_path(APP_ICON_ICO_NAME)))
         except (OSError, tk.TclError):
@@ -2676,7 +3628,6 @@ class CodexConfigApp(tk.Tk):
             ("official", "官方登录"),
         ):
             self._create_nav_item(nav, key, text)
-        self.restart_codex_button = self._create_action_nav_item(nav, "一键重启", self.restart_codex)
         self._create_nav_item(nav, "guide", "新手引导")
         self._create_nav_item(nav, "recommended", "推荐渠道")
 
@@ -2800,31 +3751,6 @@ class CodexConfigApp(tk.Tk):
         button.pack(side="left", fill="both", expand=True)
         self.nav_items[key] = (row, indicator, button)
 
-    def _create_action_nav_item(self, parent: tk.Misc, text: str, command) -> tk.Button:
-        row = tk.Frame(parent, bg="#5b5b5b", height=42)
-        row.pack(fill="x")
-        row.pack_propagate(False)
-        tk.Label(row, bg="#5b5b5b", width=1).pack(side="left", fill="y")
-        button = tk.Button(
-            row,
-            text=text,
-            command=command,
-            bg="#5b5b5b",
-            fg="#ffffff",
-            activebackground="#6a6a6a",
-            activeforeground="#ffffff",
-            disabledforeground="#b9bdc1",
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-            anchor="w",
-            padx=24,
-            cursor="hand2",
-            font=("Microsoft YaHei UI", 10, "bold"),
-        )
-        button.pack(side="left", fill="both", expand=True)
-        return button
-
     def show_page(self, key: str) -> None:
         page = self.pages.get(key)
         if page is None:
@@ -2842,38 +3768,6 @@ class CodexConfigApp(tk.Tk):
             self.refresh_profiles()
         elif key == "official":
             self._refresh_official_page()
-
-    def restart_codex(self) -> None:
-        running = False
-        if os.name == "nt":
-            try:
-                running = codex_restart_target(
-                    list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
-                ) is not None
-            except OSError:
-                running = False
-        prompt = "是否确认重启 Codex？" if running else "Codex 当前未启动，是否启动 Codex？"
-        if not self.ask_yes_no(prompt):
-            return
-        self.restart_codex_button.configure(state="disabled", cursor="arrow")
-        self._notify("正在重启 Codex...")
-
-        def worker() -> None:
-            try:
-                result = restart_codex_application()
-            except (CodexRestartError, OSError) as exc:
-                self.after(0, lambda: self._finish_codex_restart(str(exc)))
-                return
-            self.after(0, lambda: self._finish_codex_restart(None, result.action))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _finish_codex_restart(self, error: str | None, action: str = "restart") -> None:
-        self.restart_codex_button.configure(state="normal", cursor="hand2")
-        if error:
-            self.show_error(f"重启 Codex 失败：\n{error}")
-            return
-        self._notify("Codex 已启动。" if action == "start" else "Codex 已重新启动。")
 
     def _new_page(self, key: str) -> tk.Frame:
         page = tk.Frame(self.page_host, bg="#f3f4f7")
@@ -2930,7 +3824,7 @@ class CodexConfigApp(tk.Tk):
         self.key_entry = self._readonly_field(details, 0, "API Key", self.api_key_var, secret=True)
         self._readonly_field(details, 1, "Provider 显示名称", self.provider_var)
         self._readonly_field(details, 2, "Base URL", self.base_url_var)
-        self._model_field(details, 3)
+        self._readonly_field(details, 3, "启动默认模型", self.model_var)
 
     def _readonly_field(self, parent: tk.Misc, row: int, label: str, variable: tk.StringVar, secret: bool = False) -> ttk.Entry:
         tk.Label(parent, text=label, bg="#ffffff", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(row=row, column=0, sticky="w", padx=(0, 18), pady=6)
@@ -2949,112 +3843,6 @@ class CodexConfigApp(tk.Tk):
             self.key_toggle_button = self._eye_button(field, self.toggle_key_visibility, "#f7f8f9")
             self.key_toggle_button.place(relx=1.0, rely=0.5, anchor="e", x=-6, y=0)
         return entry
-
-    def _model_field(self, parent: tk.Misc, row: int) -> None:
-        tk.Label(parent, text="Model", bg="#ffffff", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(
-            row=row,
-            column=0,
-            sticky="w",
-            padx=(0, 18),
-            pady=6,
-        )
-        field = tk.Frame(parent, bg="#ffffff")
-        field.grid(row=row, column=1, sticky="ew", pady=6)
-        self.model_combo = ttk.Combobox(
-            field,
-            textvariable=self.model_var,
-            values=(self.model_var.get(),),
-            state="normal",
-            style="Model.TCombobox",
-        )
-        self.model_combo.pack(side="left", fill="both", expand=True, ipady=1)
-        self.model_combo.bind("<<ComboboxSelected>>", self._select_current_model)
-        self.model_combo.bind("<Return>", self._select_current_model)
-        self.model_combo.bind("<FocusOut>", self._select_current_model)
-        self.model_combo.bind("<Escape>", self._cancel_current_model_edit)
-        self.model_dropdown_button = tk.Canvas(
-            field,
-            width=28,
-            height=29,
-            bg="#f7f8f9",
-            highlightthickness=0,
-            borderwidth=0,
-            cursor="hand2",
-        )
-        self.model_dropdown_button.place(
-            in_=self.model_combo,
-            relx=1.0,
-            rely=0.5,
-            anchor="e",
-            x=-1,
-            width=28,
-            height=29,
-        )
-        self._draw_model_dropdown_button()
-        self.model_dropdown_button.bind("<Enter>", lambda _event: self._draw_model_dropdown_button(True))
-        self.model_dropdown_button.bind("<Leave>", lambda _event: self._draw_model_dropdown_button())
-        self.model_dropdown_button.bind("<Button-1>", self._post_model_dropdown)
-        self.fetch_models_button = ttk.Button(
-            field,
-            text="获取模型",
-            command=self.fetch_models,
-            style="Secondary.TButton",
-            width=10,
-        )
-        self.fetch_models_button.pack(side="left", padx=(8, 0), ipady=3)
-
-    def _draw_model_dropdown_button(self, active: bool = False) -> None:
-        button = self.model_dropdown_button
-        button.configure(bg="#edf0f2" if active else "#f7f8f9")
-        button.delete("all")
-        button.create_line(8, 11, 13, 16, 18, 11, fill="#59616d", width=2, joinstyle="round")
-        button.create_rectangle(27, 0, 28, 29, fill="#a8adb2", outline="")
-
-    def _post_model_dropdown(self, _event=None) -> str:
-        if str(self.model_combo.cget("state")) == "disabled":
-            return "break"
-        self.model_combo.focus_set()
-        try:
-            self.model_combo.tk.call("ttk::combobox::Post", str(self.model_combo))
-            popup = self.model_combo.tk.call("ttk::combobox::PopdownWindow", str(self.model_combo))
-            self.model_combo.tk.call(popup, "configure", "-borderwidth", 0)
-            right_border = f"{popup}.model_right_border"
-            if not self.model_combo.tk.call("winfo", "exists", right_border):
-                self.model_combo.tk.call(
-                    "frame",
-                    right_border,
-                    "-background",
-                    "#a8adb2",
-                    "-borderwidth",
-                    0,
-                    "-highlightthickness",
-                    0,
-                )
-            self.model_combo.tk.call(
-                "place",
-                right_border,
-                "-in",
-                popup,
-                "-relx",
-                1.0,
-                "-x",
-                -1,
-                "-rely",
-                0,
-                "-anchor",
-                "ne",
-                "-width",
-                1,
-                "-relheight",
-                1.0,
-            )
-            self.model_combo.tk.call("raise", right_border)
-            scrollbar = f"{popup}.f.sb"
-            if self.model_combo.tk.call("winfo", "exists", scrollbar):
-                self.model_combo.tk.call("grid", "remove", scrollbar)
-        except tk.TclError:
-            self.model_combo.event_generate("<Alt-Down>")
-        return "break"
 
     def _build_official_page(self) -> None:
         page = self._new_page("official")
@@ -3077,8 +3865,8 @@ class CodexConfigApp(tk.Tk):
         self._page_header(page, "新手引导", "配置助手主要提供新增配置和切换配置两个功能。")
         panel = self._panel(page, (20, 15))
         sections = (
-            ("新增配置", ("打开“新增配置”，填写配置名称、API Key、Provider 显示名称、Base URL 和 Model。", "点击“保存配置”仅保存配置；点击“保存并使用”会立即切换，并需要重启 Codex。")),
-            ("切换配置", ("打开“切换配置”，选择已保存的配置并点击“切换到该配置”。", "切换完成后请关闭本工具并重新启动 Codex，使新配置生效。")),
+            ("新增配置", ("打开“新增配置”，填写配置名称、API Key、Provider 显示名称、Base URL 和启动默认模型。", "获取模型后选择默认模型，点击“保存配置”会一并保存模型列表。")),
+            ("切换配置", ("双击目标配置即可应用并启动 Codex；运行中切换时需确认自动重启。", "编辑正在使用的配置后，也需要双击该配置应用修改。")),
         )
         for title, messages in sections:
             tk.Label(panel, text=title, bg="#ffffff", fg="#20242b", anchor="w", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
@@ -3093,31 +3881,68 @@ class CodexConfigApp(tk.Tk):
         panel_outer.pack(fill="both", expand=True, padx=28, pady=(0, 28))
         panel = tk.Frame(panel_outer, bg="#ffffff", padx=20, pady=15)
         panel.pack(fill="both", expand=True)
-        row = tk.Frame(
-            panel,
-            bg="#ffffff",
-            highlightthickness=1,
-            highlightbackground="#e2e5e8",
-            highlightcolor="#e2e5e8",
-            cursor="hand2",
+
+        def add_channel(
+            title: str,
+            url: str,
+            icon_image: tk.PhotoImage | None = None,
+            icon_text: str = "",
+        ) -> None:
+            row = tk.Frame(
+                panel,
+                bg="#ffffff",
+                highlightthickness=1,
+                highlightbackground="#e2e5e8",
+                highlightcolor="#e2e5e8",
+                cursor="hand2",
+            )
+            row.pack(fill="x", pady=(0, 10))
+            icon = tk.Label(
+                row,
+                text=icon_text,
+                bg="#eef5f2",
+                fg="#355d52",
+                width=4,
+                height=2,
+                font=("Microsoft YaHei UI", 9, "bold"),
+            )
+            if icon_image is not None:
+                scale = max(1, icon_image.width() // 28)
+                if scale > 1:
+                    icon_image = icon_image.subsample(scale, scale)
+                icon.configure(image=icon_image, text="", width=36, height=36)
+                icon.image = icon_image
+            icon.pack(side="left", padx=(12, 10), pady=10)
+            text_frame = tk.Frame(row, bg="#ffffff")
+            text_frame.pack(side="left", fill="x", expand=True, pady=9)
+            title_label = tk.Label(
+                text_frame,
+                text=title,
+                bg="#ffffff",
+                fg="#20242b",
+                anchor="w",
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+            title_label.pack(anchor="w")
+            address = tk.Label(
+                text_frame,
+                text=url,
+                bg="#ffffff",
+                fg="#2f6f5e",
+                anchor="w",
+                cursor="hand2",
+                font=("Microsoft YaHei UI", 9, "underline"),
+            )
+            address.pack(anchor="w", pady=(3, 0))
+            for widget in (row, icon, text_frame, title_label, address):
+                widget.bind("<Button-1>", lambda _event, target=url: webbrowser.open(target, new=2))
+
+        add_channel(
+            "AI Ark API    更高性价比    快速稳定    隐私安全    价格透明",
+            RECOMMENDED_CHANNEL_URL,
+            icon_image=self.arkapi_icon_image,
         )
-        row.pack(fill="x", pady=(0, 10))
-        icon = tk.Label(row, bg="#eef5f2", width=36, height=36)
-        if self.arkapi_icon_image is not None:
-            icon_image = self.arkapi_icon_image
-            scale = max(1, icon_image.width() // 28)
-            if scale > 1:
-                icon_image = icon_image.subsample(scale, scale)
-            icon.configure(image=icon_image, width=36, height=36)
-            icon.image = icon_image
-        icon.pack(side="left", padx=(12, 10), pady=10)
-        text_frame = tk.Frame(row, bg="#ffffff")
-        text_frame.pack(side="left", fill="x", expand=True, pady=9)
-        tk.Label(text_frame, text="AI Ark API    更高性价比    快速稳定    隐私安全    价格透明", bg="#ffffff", fg="#20242b", anchor="w", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
-        address = tk.Label(text_frame, text=RECOMMENDED_CHANNEL_URL, bg="#ffffff", fg="#2f6f5e", anchor="w", cursor="hand2", font=("Microsoft YaHei UI", 9, "underline"))
-        address.pack(anchor="w", pady=(3, 0))
-        for widget in (row, icon, text_frame, address):
-            widget.bind("<Button-1>", lambda _event: webbrowser.open(RECOMMENDED_CHANNEL_URL, new=2))
+        add_channel("JM2 API", JM2API_CHANNEL_URL, icon_image=self.jm2api_icon_image)
 
     def _center_main_window(self) -> None:
         x = max((self.winfo_screenwidth() - WINDOW_WIDTH) // 2, 0)
@@ -3268,7 +4093,11 @@ class CodexConfigApp(tk.Tk):
 
     def _build_profiles_page(self) -> None:
         page = self._new_page("profiles")
-        self._page_header(page, "已保存配置", "按配置名称或 Base URL 查找，并切换、编辑或删除配置。")
+        self._page_header(
+            page,
+            "已保存配置",
+            "双击目标配置，软件会保存当前公开设置、切换配置并自动启动 Codex。",
+        )
 
         toolbar = tk.Frame(page, bg="#f3f4f7")
         toolbar.pack(fill="x", padx=28, pady=(0, 10))
@@ -3491,18 +4320,75 @@ class CodexConfigApp(tk.Tk):
 
     def _switch_selected_profile(self) -> None:
         records = self._selected_profile_records()
-        if len(records) != 1 or self.profile_multi_mode:
+        if len(records) != 1 or self.profile_multi_mode or self.profile_switch_in_progress:
             return
         selected = records[0]
+        config_dir = self.current_path()
+        selected_key = normalized_path_key(selected.path)
+        configured_active = active_profile_path(config_dir)
+        pending_active = pending_active_profile_path(config_dir)
+        resolved_active = resolve_active_profile(config_dir)
+        selected_is_active = any(
+            profile is not None and normalized_path_key(profile.path) == selected_key
+            for profile in (resolved_active,)
+        ) or any(
+            path is not None and normalized_path_key(path) == selected_key
+            for path in (configured_active, pending_active)
+        )
+        selected_pending = profile_has_pending_apply(config_dir, selected.path)
         try:
-            restore_backup(self.current_path(), selected.path)
+            running = codex_restart_target(
+                list_windows_processes({"ChatGPT.exe", "codex.exe", "codex-code-mode-host.exe"})
+            ) is not None
         except OSError as exc:
-            self.show_error(f"切换配置失败：\n{exc}")
+            self.show_error(f"无法检查 Codex 运行状态：\n{exc}")
             return
-        set_official_login_mode(self.current_path(), False)
+        if selected_is_active and running and not selected_pending:
+            self._notify(f"Codex 已在使用配置：{selected.name}，并且正在运行。")
+            return
+        if running and not self.ask_yes_no("应用配置需要正常退出并重新启动 Codex，是否继续？"):
+            return
+        self.profile_switch_in_progress = True
+        self._notify(
+            f"正在保存当前配置并应用：{selected.name}..."
+            if running
+            else f"正在应用配置并启动 Codex：{selected.name}..."
+        )
+
+        def worker() -> None:
+            try:
+                result = switch_saved_profile(
+                    config_dir,
+                    selected.path,
+                    allow_running_restart=running,
+                )
+            except Exception as exc:
+                error = str(exc) or exc.__class__.__name__
+                self.after(0, lambda error=error: self._finish_profile_switch(selected, error))
+                return
+            self.after(0, lambda: self._finish_profile_switch(selected, None, result.action))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_profile_switch(
+        self,
+        selected: BackupRecord,
+        error: str | None,
+        action: str = "restart",
+    ) -> None:
+        self.profile_switch_in_progress = False
+        if error:
+            self.reload_current()
+            self.refresh_profiles()
+            self.show_error(f"切换配置失败：\n{error}")
+            return
         self.reload_current()
         self.refresh_profiles(selected.path)
-        self._notify(f"已切换到配置：{selected.name}；请重新启动 Codex。")
+        self._notify(
+            f"已切换到配置：{selected.name}，Codex 已启动。"
+            if action == "start"
+            else f"已切换到配置：{selected.name}，Codex 已重新启动。"
+        )
 
     def _profile_double_click(self, event) -> str:
         item = self.profile_tree.identify_row(event.y)
@@ -3584,11 +4470,19 @@ class CodexConfigApp(tk.Tk):
     def _show_profile_editor(self, record: BackupRecord | None = None) -> None:
         config_dir = self.current_path()
         source = read_codex_config(record.path if record is not None else config_dir)
-        active_record = find_matching_backup(config_dir)
+        active_record = resolve_active_profile(config_dir)
+        configured_active = active_profile_path(config_dir)
+        pending_active = pending_active_profile_path(config_dir)
         editing_active = (
             record is not None
-            and active_record is not None
-            and normalized_path_key(record.path) == normalized_path_key(active_record.path)
+            and any(
+                path is not None and normalized_path_key(record.path) == normalized_path_key(path)
+                for path in (
+                    active_record.path if active_record is not None else None,
+                    configured_active,
+                    pending_active,
+                )
+            )
         )
 
         dialog = tk.Toplevel(self)
@@ -3601,7 +4495,7 @@ class CodexConfigApp(tk.Tk):
         container = tk.Frame(dialog, bg="#f3f4f7", padx=22, pady=18)
         container.pack(fill="both", expand=True)
         title = "编辑配置" if record is not None else "新增配置"
-        subtitle = "修改后将同步更新当前正在使用的配置。" if editing_active else "保存到配置库，或保存后立即切换使用。"
+        subtitle = "保存配置后，双击配置即可应用并启动 Codex。"
         tk.Label(container, text=title, bg="#f3f4f7", fg="#171a20", font=("Microsoft YaHei UI", 14, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
         tk.Label(container, text=subtitle, bg="#f3f4f7", fg="#69707d", font=("Microsoft YaHei UI", 8)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 12))
 
@@ -3611,6 +4505,7 @@ class CodexConfigApp(tk.Tk):
         base_url_var = tk.StringVar(value=source.base_url or TEMPLATE_BASE_URL)
         model_var = tk.StringVar(value=source.model or TEMPLATE_MODEL)
         editor_show_key = tk.BooleanVar(value=False)
+        fetched_models: list[str] = read_owned_model_catalog_models(record.path) if record is not None else []
 
         def add_row(row: int, label: str, variable: tk.StringVar, secret: bool = False) -> ttk.Entry:
             tk.Label(container, text=label, bg="#f3f4f7", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=6)
@@ -3642,21 +4537,64 @@ class CodexConfigApp(tk.Tk):
         self._enable_fast_key_navigation(api_key_entry)
         add_row(4, "Provider 显示名称", provider_var)
         add_row(5, "Base URL", base_url_var)
-        add_row(6, "Model", model_var)
+        tk.Label(container, text="启动默认模型", bg="#f3f4f7", fg="#303640", font=("Microsoft YaHei UI", 9)).grid(row=6, column=0, sticky="w", padx=(0, 14), pady=6)
+        model_field = tk.Frame(container, bg="#f3f4f7")
+        model_field.grid(row=6, column=1, columnspan=2, sticky="ew", pady=6)
+        initial_models = list(fetched_models)
+        if model_var.get().strip() and model_var.get().strip() not in initial_models:
+            initial_models.insert(0, model_var.get().strip())
+        model_combo = ttk.Combobox(model_field, textvariable=model_var, values=tuple(initial_models), state="normal", style="Model.TCombobox", width=39)
+        model_combo.pack(side="left", fill="both", expand=True, ipady=1)
+
+        model_dropdown_button = tk.Canvas(
+            model_field,
+            width=28,
+            height=29,
+            bg="#f7f8f9",
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="hand2",
+        )
+        model_dropdown_button.place(in_=model_combo, relx=1.0, rely=0.5, anchor="e", x=-1, width=28, height=29)
+
+        def draw_model_dropdown(active: bool = False) -> None:
+            model_dropdown_button.configure(bg="#edf0f2" if active else "#f7f8f9")
+            model_dropdown_button.delete("all")
+            model_dropdown_button.create_line(8, 11, 13, 16, 18, 11, fill="#59616d", width=2, joinstyle="round")
+            model_dropdown_button.create_rectangle(27, 0, 28, 29, fill="#a8adb2", outline="")
+
+        def post_model_dropdown(_event=None) -> str:
+            model_combo.focus_set()
+            try:
+                model_combo.tk.call("ttk::combobox::Post", str(model_combo))
+            except tk.TclError:
+                model_combo.event_generate("<Alt-Down>")
+            return "break"
+
+        draw_model_dropdown()
+        model_dropdown_button.bind("<Enter>", lambda _event: draw_model_dropdown(True))
+        model_dropdown_button.bind("<Leave>", lambda _event: draw_model_dropdown())
+        model_dropdown_button.bind("<Button-1>", post_model_dropdown)
+
+        def fetch_editor_models() -> None:
+            try:
+                fetched_models[:] = fetch_available_models(base_url_var.get().strip(), api_key_var.get())
+            except (ModelListError, OSError) as exc:
+                error_var.set(str(exc))
+                return
+            values = list(fetched_models)
+            if model_var.get().strip() and model_var.get().strip() not in values:
+                values.insert(0, model_var.get().strip())
+            model_combo.configure(values=tuple(values))
+            model_var.set(values[0] if values else model_var.get())
+            error_var.set(f"已获取 {len(fetched_models)} 个模型")
+
+        ttk.Button(model_field, text="获取模型", command=fetch_editor_models, style="Secondary.TButton", width=10).pack(side="left", padx=(8, 0), ipady=3)
         container.columnconfigure(1, weight=1)
 
         error_var = tk.StringVar()
-        tk.Label(
-            container,
-            textvariable=error_var,
-            bg="#f3f4f7",
-            fg="#a33a32",
-            anchor="w",
-            justify="left",
-            font=("Microsoft YaHei UI", 8),
-        ).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(5, 0))
 
-        def save(apply_to_current: bool) -> None:
+        def save() -> None:
             provider_name = provider_var.get().strip()
             base_url = base_url_var.get().strip()
             model = model_var.get().strip()
@@ -3681,7 +4619,8 @@ class CodexConfigApp(tk.Tk):
                         provider_name,
                         base_url,
                         model,
-                        apply_to_current=apply_to_current,
+                        apply_to_current=False,
+                        available_models=fetched_models if fetched_models else None,
                     )
                 else:
                     saved = update_config_profile(
@@ -3692,40 +4631,49 @@ class CodexConfigApp(tk.Tk):
                         provider_name,
                         base_url,
                         model,
-                        apply_to_current=apply_to_current or editing_active,
+                        apply_to_current=False,
+                        available_models=fetched_models if fetched_models else None,
                     )
             except (OSError, json.JSONDecodeError, BackupNameError) as exc:
                 error_var.set(str(exc))
                 return
 
-            applied = apply_to_current or editing_active
-            if applied:
-                set_official_login_mode(config_dir, False)
-                self.load_path(config_dir)
+            if editing_active:
+                set_active_profile_path(saved.path)
+                set_pending_active_profile_path(saved.path)
             self.refresh_profiles(saved.path)
             dialog.destroy()
-            action = "已保存并使用" if applied else "已保存"
-            self._notify(f"{action}配置：{saved.name}")
-            suffix = "\n\n请关闭本工具并重新启动 Codex。" if applied else ""
-            self.show_info(f"{action}“{saved.name}”。{suffix}")
+            if editing_active:
+                self.load_path(config_dir)
+                self._notify(f"已保存修改：{saved.name}；请双击该配置应用。", 3000)
+                self.show_info(f"已保存修改“{saved.name}”。\n\n请双击该配置应用并启动或重启 Codex。")
+            else:
+                self._notify(f"已保存配置：{saved.name}")
+                self.show_info(f"已保存配置“{saved.name}”。")
 
         button_row = tk.Frame(container, bg="#f3f4f7")
-        button_row.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        button_row.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         ttk.Button(button_row, text="取消", command=dialog.destroy, style="Compact.TButton", width=9).pack(side="right")
-        if editing_active:
-            ttk.Button(button_row, text="保存并应用", command=lambda: save(True), style="Primary.TButton", width=12).pack(side="right", padx=(0, 8))
-        else:
-            ttk.Button(button_row, text="保存并使用", command=lambda: save(True), style="Primary.TButton", width=12).pack(side="right", padx=(0, 8))
-            ttk.Button(
-                button_row,
-                text="保存修改" if record is not None else "保存配置",
-                command=lambda: save(False),
-                style="Compact.TButton",
-                width=11,
-            ).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            button_row,
+            text="保存修改" if record is not None else "保存配置",
+            command=save,
+            style="Primary.TButton",
+            width=11,
+        ).pack(side="right", padx=(0, 8))
+        tk.Label(
+            button_row,
+            textvariable=error_var,
+            bg="#f3f4f7",
+            fg="#a33a32",
+            anchor="w",
+            justify="left",
+            wraplength=280,
+            font=("Microsoft YaHei UI", 8),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
-        self.center_window(dialog, 570, 410)
+        self.center_window(dialog, 570, 385)
         name_entry.focus_set()
         name_entry.selection_range(0, "end")
 
@@ -4311,15 +5259,19 @@ class CodexConfigApp(tk.Tk):
         self.provider_var.set(config.provider or DEFAULT_PROVIDER)
         self.base_url_var.set(config.base_url or DEFAULT_BASE_URL)
         self.model_var.set(config.model or TEMPLATE_MODEL)
-        self._current_saved_model = self.model_var.get()
-        if hasattr(self, "model_combo"):
-            self.model_combo.configure(values=(self.model_var.get(),))
-        matching_profile = None if official_login_mode else find_matching_backup(path)
+        self.model_display_name_var.set(config.model_display_name)
+        pending_profile = None if official_login_mode else pending_active_profile_path(path)
+        matching_profile = (
+            backup_record_from_path(pending_profile)
+            if pending_profile is not None
+            else (None if official_login_mode else find_matching_backup(path))
+        )
         if official_login_mode:
             self.current_config_prefix_var.set("正在使用：")
             self.current_config_name_var.set("官方登录")
             self.current_config_suffix_var.set("")
         elif matching_profile is not None:
+            set_active_profile_path(matching_profile.path)
             self.current_config_prefix_var.set("正在使用：")
             self.current_config_name_var.set(matching_profile.name)
             self.current_config_suffix_var.set(" 配置")
@@ -4329,7 +5281,6 @@ class CodexConfigApp(tk.Tk):
             self.current_config_suffix_var.set("")
         save_settings(path)
         self._refresh_official_page()
-        self._refresh_model_control_state()
         if hasattr(self, "profile_tree") and self.active_page == "profiles":
             self.refresh_profiles()
         if template_created:
@@ -4350,97 +5301,6 @@ class CodexConfigApp(tk.Tk):
         self._notify(f"已读取：{path}（{'，'.join(markers)}）")
     def reload_current(self) -> None:
         self.load_path(self.current_path())
-
-    def _refresh_model_control_state(self) -> None:
-        if not hasattr(self, "fetch_models_button"):
-            return
-        path = self.current_path()
-        state, _issues = classify_config_for_editing(path)
-        enabled = state == "editable" and not is_official_login_mode(path)
-        self.model_combo.configure(state="normal" if enabled else "readonly")
-        self.fetch_models_button.configure(
-            state="normal" if enabled and not self._model_fetch_in_progress else "disabled"
-        )
-
-    def fetch_models(self) -> None:
-        if self._model_fetch_in_progress:
-            return
-        path = self.current_path()
-        state, _issues = classify_config_for_editing(path)
-        if state != "editable" or is_official_login_mode(path):
-            self.show_error("当前配置无法获取或切换模型。")
-            return
-
-        base_url = self.base_url_var.get().strip()
-        api_key = self.api_key_var.get()
-        request_path = normalized_path_key(path)
-        self._model_fetch_in_progress = True
-        self.fetch_models_button.configure(text="获取中...", state="disabled")
-        self._notify("正在获取可用模型...")
-
-        def worker() -> None:
-            try:
-                models = fetch_available_models(base_url, api_key)
-            except ModelListError as exc:
-                self.after(0, lambda: self._finish_model_fetch(request_path, None, str(exc)))
-                return
-            except Exception:
-                self.after(0, lambda: self._finish_model_fetch(request_path, None, "获取模型时发生未知错误。"))
-                return
-            self.after(0, lambda: self._finish_model_fetch(request_path, models, None))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _finish_model_fetch(
-        self,
-        request_path: str,
-        models: list[str] | None,
-        error: str | None,
-    ) -> None:
-        self._model_fetch_in_progress = False
-        self.fetch_models_button.configure(text="获取模型")
-        self._refresh_model_control_state()
-        if request_path != normalized_path_key(self.current_path()):
-            return
-        if error is not None:
-            self.show_error(f"获取模型失败：\n{error}")
-            return
-
-        current_model = self.model_var.get().strip()
-        available_models = list(models or [])
-        if current_model and current_model not in available_models:
-            available_models.insert(0, current_model)
-        self.model_combo.configure(values=tuple(available_models))
-        self._notify(f"已获取 {len(models or [])} 个可用模型，请从下拉列表选择。", 2800)
-
-    def _select_current_model(self, _event=None) -> None:
-        selected_model = self.model_var.get().strip()
-        previous_model = self._current_saved_model
-        if not selected_model:
-            self.model_var.set(previous_model)
-            return
-        if selected_model == previous_model:
-            return
-
-        path = self.current_path()
-        available_models = tuple(self.model_combo.cget("values"))
-        self.model_combo.configure(state="disabled")
-        try:
-            save_active_model(path, selected_model)
-        except OSError as exc:
-            self.model_var.set(previous_model)
-            self._refresh_model_control_state()
-            self.show_error(f"保存模型失败：\n{exc}")
-            return
-
-        self._current_saved_model = selected_model
-        self.load_path(path)
-        self.model_combo.configure(values=available_models)
-        self._notify(f"模型已切换为 {selected_model}，重启 Codex 后生效。", 2800)
-
-    def _cancel_current_model_edit(self, _event=None) -> str:
-        self.model_var.set(self._current_saved_model)
-        return "break"
 
     def toggle_key_visibility(self) -> None:
         visible = not self.show_key_var.get()
@@ -4488,6 +5348,7 @@ class CodexConfigApp(tk.Tk):
         active_provider = self.provider_var.get().strip()
         base_url = self.base_url_var.get()
         model = self.model_var.get()
+        model_display_name = ""
         signature = build_requested_signature(path, api_key, active_provider, base_url, model, state)
         existing = find_matching_backup(path, signature)
         config_name = None
@@ -4510,11 +5371,14 @@ class CodexConfigApp(tk.Tk):
                 model,
                 state,
                 config_name,
+                model_display_name=model_display_name,
             )
         except (OSError, json.JSONDecodeError, BackupNameError) as exc:
             self.show_error(f"保存失败：\n{exc}")
             return
         set_official_login_mode(path, False)
+        if result.record is not None:
+            set_active_profile_path(result.record.path)
         result_message = self.profile_result_message(result)
         self.reload_current()
         self._notify(f"保存成功；{result_message}；当前已使用配置：{active_provider}")
@@ -4535,6 +5399,7 @@ class CodexConfigApp(tk.Tk):
             return
 
         set_official_login_mode(self.current_path(), True)
+        set_pending_active_profile_path(None)
         self.api_key_var.set("")
         self.provider_var.set(DEFAULT_PROVIDER)
         self.base_url_var.set(DEFAULT_BASE_URL)

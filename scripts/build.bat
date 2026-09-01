@@ -15,7 +15,7 @@ if not exist "codex_config_tool.py" (
     goto :failed
 )
 
-for %%F in ("assets\donation_105.png" "assets\donation_210.png" "assets\app_icon.png" "assets\app_icon_title.png" "assets\app_icon_about.png" "assets\title_about.png" "assets\title_minimize.png" "assets\title_close.png" "assets\eye_smooth.png" "assets\eye_off_smooth.png" "assets\arkapi.png" "assets\app_icon.ico" "version_info.txt") do (
+for %%F in ("assets\donation_105.png" "assets\donation_210.png" "assets\app_icon.png" "assets\app_icon_title.png" "assets\app_icon_about.png" "assets\title_about.png" "assets\title_minimize.png" "assets\title_close.png" "assets\eye_smooth.png" "assets\eye_off_smooth.png" "assets\arkapi.png" "assets\jm2api.png" "assets\app_icon.ico" "version_info.txt") do (
     if not exist "%%~F" (
         echo [ERROR] %%~F was not found.
         goto :failed
@@ -49,7 +49,7 @@ if not errorlevel 1 (
 
 echo [INFO] Building CodexConfigTool.exe...
 echo.
-python -m PyInstaller --noconfirm --clean --onefile --windowed --icon "assets\app_icon.ico" --version-file "version_info.txt" --add-data "assets\donation_105.png;assets" --add-data "assets\donation_210.png;assets" --add-data "assets\app_icon.png;assets" --add-data "assets\app_icon_title.png;assets" --add-data "assets\app_icon_about.png;assets" --add-data "assets\title_about.png;assets" --add-data "assets\title_minimize.png;assets" --add-data "assets\title_close.png;assets" --add-data "assets\eye_smooth.png;assets" --add-data "assets\eye_off_smooth.png;assets" --add-data "assets\arkapi.png;assets" --add-data "assets\app_icon.ico;assets" --name "CodexConfigTool" "codex_config_tool.py"
+python -m PyInstaller --noconfirm --clean --onefile --windowed --icon "assets\app_icon.ico" --version-file "version_info.txt" --add-data "assets\donation_105.png;assets" --add-data "assets\donation_210.png;assets" --add-data "assets\app_icon.png;assets" --add-data "assets\app_icon_title.png;assets" --add-data "assets\app_icon_about.png;assets" --add-data "assets\title_about.png;assets" --add-data "assets\title_minimize.png;assets" --add-data "assets\title_close.png;assets" --add-data "assets\eye_smooth.png;assets" --add-data "assets\eye_off_smooth.png;assets" --add-data "assets\arkapi.png;assets" --add-data "assets\jm2api.png;assets" --add-data "assets\app_icon.ico;assets" --name "CodexConfigTool" "codex_config_tool.py"
 if errorlevel 1 goto :failed
 
 echo.
