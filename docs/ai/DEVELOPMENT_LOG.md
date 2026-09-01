@@ -355,6 +355,16 @@
 相关 ID：CR-008、P-007A、TEST-007
 客户反馈：README 的新增与编辑配置截图未随其他界面更新；首次补发截图包含可识别 Base URL，随即提供了重新模糊连接信息的版本。
 工作内容：只将第二张脱敏附件写入 `docs/images/model-dropdown.png`；第一张包含明文连接地址的附件未写入仓库、未提交、未推送或上传 Release。同步将发布记录中的正式截图数量修正为 8 张。
-验证证据：图片为 `820×500` PNG，SHA-256 `F6634DFC55DEDAAAD5051A7918340BECA0D443AA2925D52512AAE2E67CABF0D3`；README 继续使用稳定相对路径 `docs/images/model-dropdown.png`。
+验证证据：图片为 `820×500` PNG，最终 SHA-256 `999A4BD0BC2BB6BCC42779657684BF670ACF06B22AAD28AEAAEABDEC93599F65`；README 继续使用稳定相对路径 `docs/images/model-dropdown.png`。
 结果：截图修正完成，不影响已验证源码和两个 EXE 的内容及 SHA-256。
 待处理 Git 操作：将本次文档修正快进推送到 `main` 并再次移动 `v1.4.0` 到修正提交，然后继续重建现有 Release。
+
+## DEV-033 - 2026-09-01 - 新增与编辑配置补充 OpenAI 原生模型提示
+
+阶段和模式：Release correction + packaging validation
+相关 ID：CR-006、CR-008、P-007B、TEST-007
+客户请求：在新增与编辑配置的文字说明中明确 Codex 使用 OpenAI 原生模型时不需要获取模型列表。
+工作内容：弹窗单行副标题和新手引导明确“OpenAI 原生模型无需获取列表，获取模型仅用于第三方 Provider”；README 和发布说明补充原生模型、显示名称和推理强度由 Codex 管理的边界；同步更新脱敏截图中的副标题。
+验证证据：Python 语法检查、118 项标准库测试和 `git diff --check` 通过；PyInstaller 6.20.0 与 Inno Setup 6.7.3 重建通过；隔离启动 4 秒保持运行并确认 JM2 资源存在。
+结果：程序、说明、截图和两个正式产物已同步；新哈希写入发布说明、验收报告和发布报告。
+待处理 Git 操作：快进推送本次修正并移动 `v1.4.0` 到最终提交，然后替换现有 Release 的两个资产和说明。

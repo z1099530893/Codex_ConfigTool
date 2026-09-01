@@ -1987,6 +1987,8 @@ class BackupManagementTests(unittest.TestCase):
         self.assertNotIn("def fetch_models(self)", source)
         self.assertIn("self.center_window(dialog, 570, 385)", source)
         self.assertIn('button_row.grid(row=7, column=0, columnspan=3', source)
+        self.assertIn("OpenAI 原生模型无需获取列表", source)
+        self.assertIn("“获取模型”仅用于第三方 Provider", source)
         self.assertIn('JM2API_CHANNEL_URL = "https://jm2api.lol"', source)
         self.assertIn('JM2API_ICON_NAME = "jm2api.png"', source)
         self.assertIn('add_channel("JM2 API", JM2API_CHANNEL_URL, icon_image=self.jm2api_icon_image)', source)

@@ -3865,7 +3865,7 @@ class CodexConfigApp(tk.Tk):
         self._page_header(page, "新手引导", "配置助手主要提供新增配置和切换配置两个功能。")
         panel = self._panel(page, (20, 15))
         sections = (
-            ("新增配置", ("打开“新增配置”，填写配置名称、API Key、Provider 显示名称、Base URL 和启动默认模型。", "获取模型后选择默认模型，点击“保存配置”会一并保存模型列表。")),
+            ("新增配置", ("打开“新增配置”，填写配置名称、API Key、Provider 显示名称、Base URL 和启动默认模型。", "OpenAI 原生模型无需获取列表；第三方 Provider 获取模型后，保存时会一并保存模型列表。")),
             ("切换配置", ("双击目标配置即可应用并启动 Codex；运行中切换时需确认自动重启。", "编辑正在使用的配置后，也需要双击该配置应用修改。")),
         )
         for title, messages in sections:
@@ -4495,7 +4495,7 @@ class CodexConfigApp(tk.Tk):
         container = tk.Frame(dialog, bg="#f3f4f7", padx=22, pady=18)
         container.pack(fill="both", expand=True)
         title = "编辑配置" if record is not None else "新增配置"
-        subtitle = "保存配置后，双击配置即可应用并启动 Codex。"
+        subtitle = "保存后双击应用；OpenAI 原生模型无需获取列表，“获取模型”仅用于第三方 Provider。"
         tk.Label(container, text=title, bg="#f3f4f7", fg="#171a20", font=("Microsoft YaHei UI", 14, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
         tk.Label(container, text=subtitle, bg="#f3f4f7", fg="#69707d", font=("Microsoft YaHei UI", 8)).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 12))
 

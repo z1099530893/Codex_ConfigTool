@@ -9,7 +9,7 @@
 
 ## 新增与改进
 
-- 在新增、编辑配置时从供应商的 OpenAI 兼容 `/models` 接口获取模型，支持下拉选择和手动输入。
+- 在新增、编辑配置时可从第三方供应商的 OpenAI 兼容 `/models` 接口获取模型，支持下拉选择和手动输入；OpenAI/Codex 原生模型无需获取列表，由 Codex 自身管理模型与推理能力。
 - 获取结果只保留在编辑事务中，点击保存后才与连接信息、启动默认模型和完整模型列表一起原子落盘。
 - 当前配置页改为只读；新增、编辑只保存配置库，双击配置统一负责应用、启动和必要的自动重启。
 - 每个第三方 Provider 独立保存启动默认模型、默认推理强度和模型目录；官方 OpenAI Provider 完全使用 Codex 原生模型与推理能力。
@@ -49,7 +49,7 @@
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| `CodexConfigTool-Setup-v1.4.0.exe` | 15,303,530 字节 | `a90ad7bac99b0b6fa0360f04af1cde777f26f7387f3f7281cf1d0a43c373a482` |
-| `CodexConfigTool-Portable-v1.4.0.exe` | 13,538,015 字节 | `d08d48a2960ab19c958f21eccfb1adc2bafb9fed1aec3d53208161e6609b1ca5` |
+| `CodexConfigTool-Setup-v1.4.0.exe` | 15,303,243 字节 | `3b14fa9acfb57f6e850e955c833e40ce8f5ad2b63c5e2b4bf28ca0359f9c7cbb` |
+| `CodexConfigTool-Portable-v1.4.0.exe` | 13,538,250 字节 | `fd704183e4e324373acedf0102231a7ecc408d511cec650f8aa8c915da1f0525` |
 
 验证环境：Windows 10 x64、Python 3.12、PyInstaller 6.20.0、Inno Setup 6.7.3。Python 语法检查、完整自动化测试、安装器检查、单文件构建和隔离启动验证均通过。
