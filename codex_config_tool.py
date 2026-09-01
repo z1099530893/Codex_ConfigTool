@@ -3864,14 +3864,16 @@ class CodexConfigApp(tk.Tk):
         page = self._new_page("guide")
         self._page_header(page, "新手引导", "配置助手主要提供新增配置和切换配置两个功能。")
         panel = self._panel(page, (20, 15))
+        important_model_hint = "供应商是GPT或者OpenAI模型时，无需获取模型"
         sections = (
-            ("新增配置", ("打开“新增配置”，填写配置名称、API Key、Provider 显示名称、Base URL 和启动默认模型。", "OpenAI 原生模型无需获取列表；第三方 Provider 获取模型后，保存时会一并保存模型列表。")),
+            ("新增配置", ("打开“新增配置”，填写配置名称、API Key、Provider 显示名称、Base URL 和启动默认模型。", important_model_hint)),
             ("切换配置", ("双击目标配置即可应用并启动 Codex；运行中切换时需确认自动重启。", "编辑正在使用的配置后，也需要双击该配置应用修改。")),
         )
         for title, messages in sections:
             tk.Label(panel, text=title, bg="#ffffff", fg="#20242b", anchor="w", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
             for message in messages:
-                tk.Label(panel, text="• " + message, bg="#ffffff", fg="#4f5865", justify="left", anchor="w", wraplength=500, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(0, 7))
+                message_color = "#8b2f2a" if message == important_model_hint else "#4f5865"
+                tk.Label(panel, text="• " + message, bg="#ffffff", fg=message_color, justify="left", anchor="w", wraplength=500, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(0, 7))
             tk.Frame(panel, bg="#eef0f2", height=1).pack(fill="x", pady=(3, 14))
 
     def _build_recommended_page(self) -> None:
