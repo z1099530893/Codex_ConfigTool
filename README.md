@@ -158,7 +158,15 @@ python -m unittest discover -s tests -q
 
 ## 打包
 
-关闭正在运行的程序后执行：
+关闭正在运行的程序后执行。以下命令需要在项目根目录运行；构建前请确认已安装 Python 3.10+，并且已经安装依赖：
+
+```powershell
+python -m pip install pyinstaller
+```
+
+### 手动打包便携版
+
+便携版是单文件 EXE，不需要安装。执行：
 
 ```bat
 scripts\build.bat
@@ -170,7 +178,17 @@ scripts\build.bat
 .\scripts\build.ps1
 ```
 
-便携版产物位于 `dist/CodexConfigTool.exe`。如需同时生成版本化便携版和安装包，请先安装 Inno Setup 6，再执行：
+构建完成后，便携版位于 `dist/CodexConfigTool.exe`。发布时建议复制为带版本号的文件名：
+
+```powershell
+$version = (Select-String -Path .\codex_config_tool.py -Pattern '^APP_VERSION\s*=\s*"([0-9.]+)"$').Matches[0].Groups[1].Value
+Copy-Item .\dist\CodexConfigTool.exe ".\dist\CodexConfigTool-Portable-v$version.exe" -Force
+Get-FileHash ".\dist\CodexConfigTool-Portable-v$version.exe" -Algorithm SHA256
+```
+
+### 手动打包安装版
+
+安装版使用 Inno Setup 6 将 `dist\CodexConfigTool.exe` 包装为安装程序。先安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)，然后执行：
 
 ```bat
 scripts\build_installer.bat
@@ -182,7 +200,20 @@ scripts\build_installer.bat
 .\scripts\build_installer.ps1
 ```
 
-最终发布产物为 `dist/CodexConfigTool-Portable-v<版本>.exe` 和 `dist/CodexConfigTool-Setup-v<版本>.exe`。`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。源码仓库只提交源码、文档、测试、构建脚本和图片资源；生成的 EXE 应作为 GitHub Release 附件发布，不提交到源码仓库。
+如果已经有用户自己打包好的便携版，只生成安装版时可以跳过便携版构建：
+
+```powershell
+Copy-Item .\dist\CodexConfigTool-Portable-v<版本>.exe .\dist\CodexConfigTool.exe -Force
+.\scripts\build_installer.ps1 -SkipPortableBuild
+```
+
+也可以直接调用 Inno Setup 编译器（默认安装路径如下）：
+
+```powershell
+& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /DMyAppVersion=<版本> .\packaging\CodexConfigTool.iss
+```
+
+最终发布产物为 `dist/CodexConfigTool-Portable-v<版本>.exe` 和 `dist/CodexConfigTool-Setup-v<版本>.exe`。使用 `Get-FileHash <文件> -Algorithm SHA256` 核对哈希后，再将两个 EXE 一起上传到 GitHub Release。`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。源码仓库只提交源码、文档、测试、构建脚本和图片资源；生成的 EXE 应作为 GitHub Release 附件发布，不提交到源码仓库。
 
 ## 文件结构
 
