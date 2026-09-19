@@ -10,7 +10,7 @@
 - 便携版：`CodexConfigTool-Portable-v1.5.0.exe`，53,519,038 字节，SHA-256 `70c8448a0926d65a289761101d36a723c4414d662f6a73338c470b6240446399`
 - 安装版：`CodexConfigTool-Setup-v1.5.0.exe`，54,956,911 字节，SHA-256 `92a43ce0af0d29a4eed31b58051206c79884a4e775bbe19f5063ba04afe134a7`
 - 前端：只有 Qt（PySide6）。**Tk 版自本版起不再发布**，但其视图层保留在 `codex_config_tool.py` 中——`codex_config_qt.py` 通过 `import codex_config_tool as core` 把它当业务逻辑库使用，删除即导致发布的前端无法启动。
-- 验证：Python 3.13.9 语法检查；**127 项标准库测试**；PyInstaller 6.22.2 重建（47 秒）；Inno Setup 6.7.1 编译；打包启动 **8/8**；恢复闪烁复测 8 轮 `blank 0` / `native_descendants 0`；`DestName` 改名语义用一个一次性安装器实测确认。
+- 验证：Python 3.13.9 语法检查；**127 项标准库测试**；PyInstaller 6.22.2 重建（47 秒）；Inno Setup 6.7.1 编译；打包启动 **8/8**；最小化/恢复循环 **55/55**；恢复闪烁复测 8 轮 `blank 0` / `native_descendants 0`——三项均在本次构建的字节上重跑；`DestName` 改名语义用一个一次性安装器实测确认。
 - 上传后核对：发布页正文与本地 `docs/RELEASE_NOTES_1.5.0.md` 逐字符一致（4,973 字符）；两个附件的字节数与 SHA-256 与本地一致（对照 GitHub 的 `digest` 字段）；`releases/latest` 指向 `v1.5.0`。
 - 已知限制：**安装/升级路径未经端到端验证**——本机已装 v1.4.0，运行安装包会覆盖用户的实际安装，因此安装路径的结论来自编译期证据加 `DestName` 实测。真实 Codex 环境、任务栏、系统托盘与闪烁结论仍需用户复测。
 - 顺序瑕疵（如实记录）：本文件的 1.5.0 段落写在打标签**之后**，位于 `7c9e52c`，因此从 `v1.5.0` 标签生成的源码归档里还没有这一段。修正需要移动已公开的标签（即强推 tag ref），与"不强制推送、不改写历史"的约定冲突，故保留现状。**下次发布应先把本报告写完再打标签。**

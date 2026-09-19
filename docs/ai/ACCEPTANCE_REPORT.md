@@ -6,6 +6,7 @@
 - 版本源一致：`APP_VERSION`、Windows 版本资源、安装器定义、产物名称与发布说明均为 `1.5.0`。
 - PyInstaller 6.22.2 重建 `dist\CodexConfigTool-Qt.exe` 用 47 秒；Inno Setup 6.7.1 编译安装包通过，日志确认压缩的输入正是 `dist\CodexConfigTool-Qt.exe`。
 - 打包启动验证 **8/8**：窗口类 `Qt6112QWindowIcon`、`820x500`、无原生边框、0 个原生子窗口、`WS_SYSMENU|WS_MINIMIZEBOX` 在位、无分层样式、设置写入隔离 `APPDATA`、真实 `settings.json` 未被触碰。
+- 最小化/恢复循环 **55/55**（`verify_packaged_cycles.py`，5 轮，走 Win32 API 而非鼠标注入）。覆盖：打开时只有一个自绘标题栏、最小化后进程存活、恢复后仍只有一个标题栏、反复循环尺寸恒为 `820x500`。**不覆盖**：标题栏拖动、应用自身最小化按钮与真实任务栏按钮的点击路径、任务栏按钮确实存在——那四项只有 `accept_packaged_exe.py` 能验，需要合成输入。
 - 恢复闪烁复测在**本次构建的字节上**重跑 8 轮（`--strip-top 300 --sidebar-max 120`）：每轮 `blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`；报告 `prototypes/out/flash-qt-exe-v150-rebuilt.json`。写在**新路径**而不是覆盖旧报告——旧记录本身是上一份字节的基线。
 - 发布资产只来自 Qt 前端：
   - `CodexConfigTool-Setup-v1.5.0.exe`：54,956,911 字节，SHA-256 `92a43ce0af0d29a4eed31b58051206c79884a4e775bbe19f5063ba04afe134a7`

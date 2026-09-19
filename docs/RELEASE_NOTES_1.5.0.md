@@ -92,7 +92,7 @@ Qt 前端复用 `codex_config_tool.py` 的全部业务逻辑（配置读写、�
 | `CodexConfigTool-Setup-v1.5.0.exe` | 54,956,911 字节 | `92a43ce0af0d29a4eed31b58051206c79884a4e775bbe19f5063ba04afe134a7` |
 | `CodexConfigTool-Portable-v1.5.0.exe` | 53,519,038 字节 | `70c8448a0926d65a289761101d36a723c4414d662f6a73338c470b6240446399` |
 
-验证环境：Windows 10 19044、Python 3.13.9、PySide6 6.11.2、PyInstaller 6.22.2、Inno Setup 6.7.1。Python 语法检查、127 项自动化测试、两个资产的构建、打包启动验证（8/8）、隔离启动冒烟，以及在**本次构建的字节上**重跑的恢复闪烁复测（8 轮，`blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`）均通过。
+验证环境：Windows 10 19044、Python 3.13.9、PySide6 6.11.2、PyInstaller 6.22.2、Inno Setup 6.7.1。Python 语法检查、127 项自动化测试、两个资产的构建、打包启动验证（8/8）、最小化/恢复循环（55/55）、隔离启动冒烟，以及在**本次构建的字节上**重跑的恢复闪烁复测（8 轮，`blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`）均通过。**安装/升级路径未经端到端验证**——本机已装 1.4.0，运行安装包会覆盖现有安装。
 
 ## 已知问题
 

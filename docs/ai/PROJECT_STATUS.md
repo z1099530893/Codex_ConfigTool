@@ -18,7 +18,7 @@
 ## 验证
 
 - Python 3.13.9 语法检查、**127 项标准库测试**、PyInstaller 6.22.2 构建、Inno Setup 6.7.1 编译通过。
-- 打包启动验证 **8/8**（窗口类 `Qt6112QWindowIcon`、`820x500`、无原生边框、0 原生子窗口、任务栏样式在位、隔离 APPDATA）。最小化/恢复循环验证 **55/55**；恢复闪烁复测在**本次构建的字节上**重跑 8 轮：`blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`（报告 `prototypes/out/flash-qt-exe-v150-rebuilt.json`）。
+- 打包启动验证 **8/8**（窗口类 `Qt6112QWindowIcon`、`820x500`、无原生边框、0 原生子窗口、任务栏样式在位、隔离 APPDATA）、最小化/恢复循环 **55/55**（`verify_packaged_cycles.py`，5 轮）、恢复闪烁复测 **8 轮** `blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`。**三项都在本次构建的字节上重跑**（闪烁报告 `prototypes/out/flash-qt-exe-v150-rebuilt.json`）。
 - 打包版验收脚本（拖动、两条点击路径、任务栏按钮真实存在）**PASS 5/5**——此前三次均被宿主机的合成输入限制挡在注入之前。
 - `DestName` 的改名语义用一个一次性安装器（独立 `AppId`、`Uninstallable=no`、装到临时目录）实测确认：`version_info.txt` 确实落成 `ProbeTarget.txt`，且未留下注册表项。
 - **未修改真实 `.codex`、API Key、聊天记录或用户配置。**
