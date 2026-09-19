@@ -128,7 +128,7 @@ assets/app_icon.ico
 version_info.txt
 ```
 
-使用 `scripts\build.bat` 或 `scripts\build.ps1` 构建原始单文件 EXE。安装 Inno Setup 6 后，使用 `scripts\build_installer.bat` 或 `scripts\build_installer.ps1` 同时生成版本化便携版与安装包。`dist/`、`build/`、`*.spec`、`__pycache__/` 已加入 `.gitignore`，不提交到源码仓库。两个发布产物均上传到 GitHub Releases。
+安装 Inno Setup 6 后，使用统一入口 `scripts\build.bat` 同时生成版本化便携版与安装包；底层 PowerShell 入口为 `scripts\build_installer.ps1`。`dist/`、`build/`、`*.spec`、`__pycache__/` 已加入 `.gitignore`，不提交到源码仓库。两个发布产物均上传到 GitHub Releases。
 
 安装包定义位于 `packaging/CodexConfigTool.iss`。安装范围固定为当前用户，默认目录为 `%LOCALAPPDATA%\Programs\CodexConfigTool`，不要求管理员权限；桌面快捷方式默认勾选但允许取消，并创建开始菜单与卸载入口。安装器只能打包应用 EXE，不得包含、迁移、删除或重置 `.codex`、`auth.json`、`config.toml`、会话目录或历史记录。
 

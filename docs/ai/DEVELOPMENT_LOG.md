@@ -1,5 +1,99 @@
 # 开发记录
 
+## DEV-043 - 2026-09-09 - 固定无标题栏窗口尺寸并重建验证包
+
+阶段和模式：Iterative Development / Development + Packaging validation
+相关 ID：BUG-005、TEST-008、CR-008
+工作内容：保持正常顶层窗口生命周期，仅在初始化阶段移除原生标题栏/边框并注册任务栏样式；最小化和恢复不再动态修改窗口样式、重建窗口或调用 Win32 显示 API。针对 Windows 非客户区尺寸调整初始 Tk 外壳宽度，使自绘界面稳定为 820×500。
+验证证据：隔离运行连续 10 次最小化/恢复，尺寸始终为 `(820, 500)`；Python 语法检查、118 项标准库测试和 `git diff --check` 通过；统一构建入口成功生成 `dist/CodexConfigTool-Portable-v1.4.0.exe` 和 `dist/CodexConfigTool-Setup-v1.4.0.exe`；便携版启动后保持运行 4 秒。尚未提交、推送或更新 GitHub Release，任务栏真实鼠标点击仍需用户在本机最终确认。
+
+## DEV-044 - 2026-09-09 - 参考图像管理器改用 Windows 原生拖动
+
+阶段和模式：Iterative Development / Development
+相关 ID：BUG-005、TEST-008、CR-008
+客户反馈：新包仍出现窗口内容破碎、尺寸增长和边界状态异常；此前将自动化测试结果误报为完整修复。
+工作内容：参考 `Image-Management/qt_app_v20.py` 的 `startSystemMove` 思路，Windows 下标题栏拖动改为向同一个顶层 HWND 发送 `WM_NCLBUTTONDOWN/HTCAPTION`，不再在鼠标移动期间高频调用 Tk `geometry()`；非 Windows 保留原有拖动回退路径。保留最小化/恢复生命周期不重建窗口的约束。
+验证证据：语法检查、118 项标准库测试、隔离窗口连续最小化/恢复测试和 `git diff --check` 通过。尚未声称真实鼠标拖动或任务栏点击已验收，未提交、推送或更新 Release。
+
+## DEV-036 - 2026-09-09 - 修复任务栏句柄回归并统一构建入口
+
+阶段和模式：Iterative Development / Development
+相关 ID：BUG-005、TEST-008、CR-008
+客户复测：任务栏图标点击无反应，关闭行为异常；同时询问能否将便携版和安装版打包合并为一个入口。
+根因判断：上一轮为避免任务栏按钮重建而改用 `winfo_id()`，但 Windows/Tk 的任务栏注册使用的是 `GetParent(winfo_id()) or winfo_id()` 得到的顶层 HWND，导致最小化命令没有作用于实际任务栏窗口。
+工作内容：恢复最小化使用已注册的顶层 HWND，并改为异步投递 `WM_SYSCOMMAND/SC_MINIMIZE`，避免在 Tk 回调中同步调用 Win32 导致 Python GIL 崩溃；移除不必要的自定义 WndProc 安装；为根窗口显式设置 `WM_DELETE_WINDOW` 到 `destroy`。将 `scripts\build.bat` 改为统一调用 `build_installer.ps1`，一次生成版本化便携版和安装版，并补充两个完整路径和成功/失败暂停提示。
+追加诊断：上一版使用 `PostMessageW` 但未声明 64 位 HWND 的 ctypes 参数类型，句柄被按 32 位整数截断，因此最小化和任务栏恢复消息实际没有作用。
+追加修复：为 `GetParent` 和 `PostMessageW` 设置完整的 Win32 `wintypes` 参数/返回类型，确保 64 位窗口句柄正确传递。
+验证证据：`python -m py_compile codex_config_tool.py` 通过；118 项标准库测试通过；`git diff --check` 通过；隔离 Tk 运行时执行任务栏等效的最小化→恢复→关闭，输出 `minimize-runtime-ok`；未执行 Git 提交、推送、Tag 或 Release。
+结果：FIXED-BUT-CLIENT-RETEST；等待客户使用新构建包复测任务栏点击最小化/恢复、标题栏关闭和构建输出窗口。
+待处理 Git 操作：未获得提交、推送、Tag 或 Release 授权，保持未提交状态。
+
+## DEV-042 - 2026-09-09 - 重建窗口基线验证包
+
+阶段和模式：Release preparation / Development validation
+相关 ID：BUG-005、TEST-008、CR-008
+工作内容：基于稳定 Tk 无边框窗口基线重建便携版和安装版；未更新 GitHub。
+验证证据：便携版和安装版成功生成；便携版启动后保持运行 3 秒并正常结束测试实例；118 项标准库测试、Python 语法检查和 `git diff --check` 通过。
+产物：`dist/CodexConfigTool-Portable-v1.4.0.exe`（13,342,155 字节，SHA-256 `BA0042CD77512CF653C45FFB33F1B1F2E2B44EF70FE098805E6A4B0D07D89BAF`）；`dist/CodexConfigTool-Setup-v1.4.0.exe`（15,142,360 字节，SHA-256 `701AB398D51C7F002AC31F2A210DC2D698784AC8E7A0E1DD7703991D5D56D994`）。
+结果：FIXED-BUT-CLIENT-RETEST；需要客户实际打开新便携版/安装版，复测主窗口尺寸、拖动、最小化、任务栏切换和闪烁。
+待处理 Git 操作：未获得提交、推送、Tag 或 Release 授权，保持未提交状态。
+
+## DEV-040 - 2026-09-09 - 撤回恢复闪烁改动并修正窗口尺寸
+
+阶段和模式：Iterative Development / Development
+相关 ID：BUG-005、TEST-008、CR-008
+客户反馈：上一轮恢复路径改动后，重新打包启动出现主界面尺寸变化、拖动破碎窗口和恢复闪烁。
+处理：撤回上一轮“恢复时不再刷新样式”的单独改动；保留已验证的稳定顶层窗口方案，并修正隐藏原生边框后 Windows/Tk 产生的 `836x500` 外框偏差，在初始化阶段动态抵消边框宽度，恢复固定 `820x500`。恢复过程中不重复修改几何尺寸。
+验证证据：隔离布局测试通过，输出 `layout-runtime (820, 500) (820, 500)`；Python 语法检查、118 项标准库测试和 `git diff --check` 通过。
+结果：FIXED-BUT-CLIENT-RETEST；尚未重建发布包，等待客户确认主界面尺寸、拖动和任务栏恢复视觉效果。
+待处理 Git 操作：未获得提交、推送、Tag 或 Release 授权，保持未提交状态。
+
+## DEV-041 - 2026-09-09 - 恢复稳定无边框窗口生命周期
+
+阶段和模式：Iterative Development / Development + Packaging validation
+相关 ID：BUG-005、TEST-008、CR-008
+客户反馈：重新打包后主界面尺寸持续增大、最大化闪烁仍存在，拖动产生破碎窗口。
+根因证据：实际隔离运行触发 Python GIL 崩溃，堆栈位于注入的 `custom_wndproc`；动态 `SetWindowLongW/SetWindowPos/geometry` 方案还会改变 Tk/Windows 外框尺寸。
+工作内容：撤回动态原生边框隐藏、尺寸补偿和自定义 WndProc 注入；恢复 Tk 无边框窗口基线，最小化仅切换 `overrideredirect(False)` 后调用 `iconify()`，恢复时按原有 Tk 生命周期重新启用无边框框架；任务栏只在初始化路径注册。
+验证证据：隔离启动→最小化→恢复→关闭通过；连续 10 次切换尺寸均为 `820×500`；Python 语法检查、118 项标准库测试和 `git diff --check` 通过。
+结果：FIXED-BUT-CLIENT-RETEST；本地源码已恢复稳定窗口基线，待客户确认实际打包版的尺寸、拖动、闪烁和任务栏行为后再决定是否继续发布。
+待处理 Git 操作：未获得提交、推送、Tag 或 Release 授权，保持未提交状态。
+
+
+## DEV-037 - 2026-09-09 - 修复任务栏按钮与窗口状态分离
+
+阶段和模式：Iterative Development / Development
+相关 ID：BUG-005、TEST-008、CR-008
+客户反馈：配置切换重启 Codex 后，配置助手主窗口仍在但任务栏图标消失；最小化与显示状态下，主窗口和任务栏图标只能同时存在一个。
+根因判断：恢复无边框窗口时没有重新应用 `WS_EX_APPWINDOW`；此前通过 `withdraw/deiconify` 重建 Shell 按钮又会使任务栏按钮绑定到错误的窗口状态。
+工作内容：恢复窗口后重新启用自绘框架，并在同一个顶层 HWND 上原地重新应用任务栏样式；移除 `_set_appwindow_style` 中的隐藏/显示操作，避免 Explorer 重建任务栏按钮。
+验证证据：隔离窗口状态序列测试通过：初始显示→最小化→恢复→关闭，任务栏样式持续存在；Python 语法检查、118 项标准库测试和 `git diff --check` 通过；未执行 Git 提交、推送、Tag 或 Release。
+结果：FIXED-BUT-CLIENT-RETEST；等待客户复测配置切换后图标、主窗口显示、最小化和任务栏恢复。
+待处理 Git 操作：未获得提交、推送、Tag 或 Release 授权，保持未提交状态。
+
+## DEV-038 - 2026-09-09 - 保留任务栏最小化能力
+
+阶段和模式：Iterative Development / Development
+相关 ID：BUG-005、TEST-008、CR-008
+客户反馈：主窗口最小化正常且任务栏图标不消失，但点击任务栏图标不能在显示/最小化之间切换。
+根因判断：隐藏原生边框时同时清除了窗口的系统/最小化相关样式，Windows 任务栏按钮无法按正常顶层窗口处理激活和最小化。
+工作内容：只移除 `WS_CAPTION` 和 `WS_THICKFRAME`，保留 `WS_MINIMIZEBOX`、系统菜单和任务栏窗口样式，继续使用同一个顶层 HWND。
+验证证据：隔离窗口状态测试通过，确认最小化样式持续存在且窗口可执行显示→最小化→恢复；Python 语法检查、118 项标准库测试和 `git diff --check` 通过。
+结果：FIXED-BUT-CLIENT-RETEST；等待客户实际点击任务栏按钮验证显示/最小化切换。
+待处理 Git 操作：未获得提交、推送、Tag 或 Release 授权，保持未提交状态。
+
+## DEV-035 - 2026-09-09 - 修复 Windows 最小化退出
+
+阶段和模式：Iterative Development / Development
+相关 ID：BUG-005、TEST-008、CR-008
+客户反馈：v1.4.0 点击最小化后配置助手自动退出。
+根因判断：前一版为规避退出问题在最小化/恢复时切换 `overrideredirect` 并重新注册任务栏样式，Windows Shell 会重新创建任务栏按钮，造成图标和标题刷新；任务栏按钮也未稳定复用同一个顶层 HWND。
+工作内容：保持无边框窗口和既有任务栏注册不变，使用顶层窗口自身的 HWND 调用 Win32 `SW_MINIMIZE`；恢复时不再切换窗口框架或重复注册任务栏样式。同步修复安装版构建批处理：成功时显示两个安装包的完整输出路径，失败或成功时均保留窗口供用户查看。
+回滚点：`build/rollback/bug005-minimize-exit/codex_config_tool.py`。
+验证证据：`python -m py_compile codex_config_tool.py` 通过；118 项标准库测试通过；隔离 Tk 运行时执行最小化、恢复和关闭，输出 `minimize-runtime-ok`；构建批处理已检查成功/失败分支和完整输出路径。
+结果：FIXED-BUT-CLIENT-RETEST；等待客户在实际 v1.4.0 环境确认最小化后进程保持运行、任务栏恢复和关闭行为正常。
+待处理 Git 操作：未获得提交、推送、Tag 或 Release 授权，保持未提交状态。
+
 ## DEV-027 - 2026-08-31 - 统一保存与双击应用配置事务
 
 阶段和模式：Iterative Development / Development + Packaging validation

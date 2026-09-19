@@ -29,7 +29,7 @@ except ModuleNotFoundError:  # Python 3.10 compatibility
 
 
 APP_NAME = "Codex 配置助手"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 AUTHOR_NAME = "k.x"
 CONTACT_EMAIL = "1099530893@qq.com"
 PROJECT_URL = "https://github.com/z1099530893/Codex_ConfigTool"
@@ -139,6 +139,220 @@ def register_appwindow_with_shell(hwnd: int, user32=None) -> None:
     extended_style = (extended_style & ~0x00000080) | 0x00040000
     user32.SetWindowLongW(hwnd, -20, extended_style)
     user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)  # NOMOVE | NOSIZE | NOZORDER | FRAMECHANGED
+
+
+_GWL_STYLE = -16
+_WS_SYSMENU = 0x00080000
+_WS_MINIMIZEBOX = 0x00020000
+_SWP_FRAME_ONLY = 0x0027  # NOSIZE | NOMOVE | NOZORDER | FRAMECHANGED
+
+
+def make_window_minimizable(hwnd: int, user32=None) -> bool:
+    """Add ``WS_SYSMENU | WS_MINIMIZEBOX`` so the Shell treats the window as minimizable.
+
+    The Shell decides whether a window *can* be minimized from ``WS_MINIMIZEBOX``
+    (Raymond Chen, "Why does adding WS_MINIMIZEBOX change how my window behaves
+    when the user presses Win+D?").  An ``overrideredirect`` window has neither
+    that bit nor a system menu, so Explorer treats its taskbar button as
+    activate-only: clicking the icon does not toggle minimize/restore, even
+    though the window answers ``WM_SYSCOMMAND``/``SC_MINIMIZE`` correctly.
+
+    Neither bit draws a frame - frames come from ``WS_CAPTION``/``WS_BORDER``/
+    ``WS_DLGFRAME``/``WS_THICKFRAME`` - so the non-client frame stays ``(0, 0)``
+    and the 820x500 client area is untouched.  ``WS_SYSMENU`` is what gives the
+    window the system menu that the taskbar jump list reads, and it is required
+    for ``WS_MINIMIZEBOX`` to mean anything.
+
+    ``WS_MAXIMIZEBOX`` is deliberately *not* set: it requires ``WS_THICKFRAME``,
+    which would add a native resizable border and undo the borderless design.
+
+    Returns True when the style now carries ``WS_MINIMIZEBOX``.
+    """
+    if os.name != "nt" or not hwnd:
+        return False
+    if user32 is None:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+    style = user32.GetWindowLongW(hwnd, _GWL_STYLE)
+    updated = style | _WS_SYSMENU | _WS_MINIMIZEBOX
+    if updated != style:
+        user32.SetWindowLongW(hwnd, _GWL_STYLE, updated)
+        # FRAMECHANGED makes the non-client area recompute; NOACTIVATE keeps the
+        # window from stealing focus.  No move, no resize.
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, _SWP_FRAME_ONLY)
+    return bool(user32.GetWindowLongW(hwnd, _GWL_STYLE) & _WS_MINIMIZEBOX)
+
+
+# --- Borderless-window lifecycle helpers -------------------------------------
+#
+# The main window is borderless (`overrideredirect(True)`), which makes Tk give
+# it `WS_POPUP` plus `WS_EX_TOOLWINDOW`.  Windows creates no taskbar button for
+# such a window, and simply clearing those style bits is not enough: the shell
+# decides about the button when the window is first shown, and later style
+# changes are ignored until something forces a re-evaluation.
+#
+# The supported way to add the button afterwards is `ITaskbarList::AddTab`.
+# Unlike a hide/show cycle it never touches the window geometry, so Tk's
+# 820x500 layout (and the drag path) stays intact.
+
+_TASKBAR_CLASS_ID = "{56FDF344-FD6D-11d0-958A-006097C9A090}"
+_TASKBAR_INTERFACE_ID = "{56FDF342-FD6D-11d0-958A-006097C9A090}"
+_COINIT_APARTMENT_THREADED = 0x2
+_CLSCTX_INPROC_SERVER = 0x1
+_RPC_E_CHANGED_MODE = -2147417850
+_GA_ROOT = 2
+_SW_MINIMIZE = 6
+_SW_RESTORE = 9
+
+_TASKBAR_LIST_STATE: dict[str, object] = {"instance": None, "attempted": False}
+
+
+class _TaskbarList:
+    """Thin wrapper over the shell's ``ITaskbarList`` COM interface."""
+
+    def __init__(self, pointer, add_tab, delete_tab) -> None:
+        self._pointer = pointer
+        self._add_tab = add_tab
+        self._delete_tab = delete_tab
+
+    def add_tab(self, hwnd: int) -> bool:
+        return self._add_tab(self._pointer, hwnd) == 0
+
+    def delete_tab(self, hwnd: int) -> bool:
+        return self._delete_tab(self._pointer, hwnd) == 0
+
+
+def _create_taskbar_list():
+    """Create a wrapper for ``ITaskbarList``; returns None when unavailable."""
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_ulong),
+            ("Data2", ctypes.c_ushort),
+            ("Data3", ctypes.c_ushort),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    def guid(text: str) -> GUID:
+        body = text.strip("{}").split("-")
+        tail = bytes.fromhex(body[3] + body[4])
+        return GUID(
+            int(body[0], 16),
+            int(body[1], 16),
+            int(body[2], 16),
+            (ctypes.c_ubyte * 8)(*tail),
+        )
+
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitializeEx.argtypes = (ctypes.c_void_p, wintypes.DWORD)
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    ole32.CoCreateInstance.restype = ctypes.c_long
+
+    if ole32.CoInitializeEx(None, _COINIT_APARTMENT_THREADED) not in (
+        0,
+        1,
+        _RPC_E_CHANGED_MODE,
+    ):
+        return None
+
+    class_id = guid(_TASKBAR_CLASS_ID)
+    interface_id = guid(_TASKBAR_INTERFACE_ID)
+    pointer = ctypes.c_void_p()
+    if (
+        ole32.CoCreateInstance(
+            ctypes.byref(class_id),
+            None,
+            _CLSCTX_INPROC_SERVER,
+            ctypes.byref(interface_id),
+            ctypes.byref(pointer),
+        )
+        != 0
+        or not pointer.value
+    ):
+        return None
+
+    # 0 QueryInterface, 1 AddRef, 2 Release, 3 HrInit, 4 AddTab, 5 DeleteTab
+    vtable = ctypes.cast(
+        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_void_p))[0],
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    hr_init = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vtable[3])
+    if hr_init(pointer) != 0:
+        return None
+    add_tab = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND)(vtable[4])
+    delete_tab = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND)(vtable[5])
+    return _TaskbarList(pointer, add_tab, delete_tab)
+
+
+def ensure_taskbar_button(hwnd: int, taskbar_list=None) -> bool:
+    """Ask the shell to give ``hwnd`` a taskbar button.
+
+    ``taskbar_list`` may be injected by tests.  Returns True when the shell
+    accepted the request.
+    """
+    if os.name != "nt" and taskbar_list is None:
+        return False
+    if not hwnd:
+        return False
+    if taskbar_list is None:
+        if _TASKBAR_LIST_STATE["instance"] is None and not _TASKBAR_LIST_STATE["attempted"]:
+            _TASKBAR_LIST_STATE["attempted"] = True
+            _TASKBAR_LIST_STATE["instance"] = _create_taskbar_list()
+        taskbar_list = _TASKBAR_LIST_STATE["instance"]
+    if taskbar_list is None:
+        return False
+    try:
+        return bool(taskbar_list.add_tab(hwnd))
+    except (AttributeError, OSError):
+        return False
+
+
+def resolve_toplevel_hwnd(widget_hwnd: int) -> int:
+    """Resolve the real top-level HWND for a Tk widget handle.
+
+    ``winfo_id()`` returns Tk's inner child window.  The window Windows actually
+    manages - the one that owns the taskbar button and gets minimized - is its
+    root ancestor, so never drive ``winfo_id()`` directly with Win32 calls.
+    """
+    if os.name != "nt" or not widget_hwnd:
+        return 0
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.GetAncestor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+    user32.GetAncestor.restype = ctypes.c_void_p
+    root = user32.GetAncestor(ctypes.c_void_p(widget_hwnd), _GA_ROOT)
+    return int(root or widget_hwnd)
+
+
+def minimize_toplevel_window(hwnd: int) -> bool:
+    """Minimize a borderless toplevel through Win32.
+
+    Tk's ``iconify`` does nothing for ``overrideredirect`` windows, so the custom
+    minimize button drives the OS directly.  ``ShowWindow(SW_MINIMIZE)`` keeps
+    the process alive, keeps the taskbar button and does not touch the geometry.
+    """
+    if os.name != "nt" or not hwnd:
+        return False
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    user32.ShowWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    user32.ShowWindow.restype = ctypes.c_bool
+    return bool(user32.ShowWindow(ctypes.c_void_p(hwnd), _SW_MINIMIZE))
 
 
 def resource_path(name: str) -> Path:
@@ -3279,10 +3493,8 @@ class CodexConfigApp(tk.Tk):
         self._window_drag: tuple[int, int, int, int] | None = None
         self._window_drag_latest: tuple[int, int] | None = None
         self._window_drag_job: str | None = None
-        self._minimized = False
-        self._native_hwnd: int | None = None
-        self._native_wndproc = None
-        self._original_wndproc: int | None = None
+        self._window_hwnd: int = 0
+        self._taskbar_button_ready = False
         self.app_icon_image = self._load_ui_image(APP_ICON_PNG_NAME)
         self.title_icon_image = self._load_ui_image(TITLE_ICON_PNG_NAME)
         self.title_button_images = {
@@ -3306,8 +3518,7 @@ class CodexConfigApp(tk.Tk):
         self._build_style()
         self._build_ui()
         self._center_main_window()
-        self.bind("<Map>", self._restore_custom_frame, add="+")
-        self.bind("<Unmap>", self._track_window_minimized, add="+")
+        self.bind("<Map>", self._ensure_window_integrity, add="+")
         self.bind("<Alt-F4>", lambda _event: self.destroy())
         self.bind(
             "<Control-a>",
@@ -3979,119 +4190,67 @@ class CodexConfigApp(tk.Tk):
         self._window_drag_latest = None
 
     def _minimize_window(self) -> None:
-        self._minimized = True
-        if os.name == "nt":
-            try:
-                import ctypes
+        """Minimize the borderless window without losing the taskbar button.
 
-                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
-                ctypes.windll.user32.ShowWindow(hwnd, 6)
-                return
-            except (AttributeError, OSError):
-                pass
-        self.overrideredirect(False)
+        Tk's ``iconify`` is a no-op for ``overrideredirect`` windows, so the OS is
+        asked directly.  The window keeps its frame-less style, which is what
+        prevents a native title bar from reappearing on restore.
+        """
+        if minimize_toplevel_window(self._window_handle()):
+            return
         self.iconify()
 
-    def _restore_custom_frame(self, _event=None) -> None:
-        if not self._minimized:
-            return
-        self.after_idle(self._finish_taskbar_restore)
-
-    def _track_window_minimized(self, _event=None) -> None:
-        self.after_idle(self._update_minimized_state)
-
-    def _update_minimized_state(self) -> None:
-        if not self.winfo_exists():
-            return
-        if os.name == "nt":
-            try:
-                import ctypes
-
-                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
-                if ctypes.windll.user32.IsIconic(hwnd):
-                    self._minimized = True
-                    return
-            except (AttributeError, OSError):
-                pass
-        if self.state() == "iconic":
-            self._minimized = True
-
-    def _finish_taskbar_restore(self) -> None:
-        if not self.winfo_exists() or self.state() != "normal":
-            return
-        self._minimized = False
-        if os.name != "nt":
-            self.overrideredirect(True)
-            self._set_appwindow_style()
-
-    def _set_appwindow_style(self) -> None:
+    def _window_handle(self) -> int:
+        """Resolve and cache the real top-level HWND of the main window."""
         if os.name != "nt" or not self.winfo_exists():
+            return 0
+        if self._window_hwnd:
+            return self._window_hwnd
+        try:
+            self._window_hwnd = resolve_toplevel_hwnd(self.winfo_id())
+        except (AttributeError, OSError, tk.TclError):
+            self._window_hwnd = 0
+        return self._window_hwnd
+
+    def _set_appwindow_style(self, attempt: int = 0) -> None:
+        """Register the window with the shell and give it a taskbar button."""
+        if os.name != "nt" or not self.winfo_exists():
+            return
+        hwnd = self._window_handle()
+        if not hwnd:
+            if attempt < 5:
+                self.after(200, lambda: self._set_appwindow_style(attempt + 1))
             return
         try:
             import ctypes
 
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
-            was_viewable = bool(self.winfo_viewable())
-            if was_viewable:
-                self.withdraw()
-                self.update_idletasks()
             register_appwindow_with_shell(hwnd, ctypes.windll.user32)
-            if was_viewable:
-                self.deiconify()
-                self.lift()
-                self.focus_force()
-            self._install_native_frame_handler(hwnd)
+            make_window_minimizable(hwnd, ctypes.windll.user32)
         except (AttributeError, OSError):
             pass
+        self._taskbar_button_ready = ensure_taskbar_button(hwnd)
+        if not self._taskbar_button_ready and attempt < 5:
+            self.after(300, lambda: self._set_appwindow_style(attempt + 1))
 
-    def _install_native_frame_handler(self, hwnd: int) -> None:
-        if self._native_hwnd == hwnd and self._native_wndproc is not None:
+    def _ensure_window_integrity(self, _event=None) -> None:
+        """Re-assert the taskbar button and the minimizable style after a re-map.
+
+        A re-map is the one moment Tk may re-apply ``overrideredirect`` and drop
+        the style bits added on top of it, so both are re-asserted here rather
+        than assumed to have survived.
+        """
+        if os.name != "nt" or not self.winfo_exists():
             return
+        hwnd = self._window_handle()
+        if hwnd:
+            try:
+                import ctypes
 
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        wndproc_type = ctypes.WINFUNCTYPE(
-            ctypes.c_ssize_t,
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        )
-        user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
-        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
-        user32.SetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
-        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-        user32.CallWindowProcW.argtypes = (
-            ctypes.c_void_p,
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        )
-        user32.CallWindowProcW.restype = ctypes.c_ssize_t
-
-        original_wndproc = user32.GetWindowLongPtrW(hwnd, -4)
-        if not original_wndproc:
-            return
-
-        @wndproc_type
-        def custom_wndproc(window, message, wparam, lparam):
-            if message == 0x0083 and wparam:
-                return 0
-            return user32.CallWindowProcW(original_wndproc, window, message, wparam, lparam)
-
-        previous_wndproc = user32.SetWindowLongPtrW(
-            hwnd,
-            -4,
-            ctypes.cast(custom_wndproc, ctypes.c_void_p),
-        )
-        if not previous_wndproc:
-            return
-        self._native_hwnd = hwnd
-        self._original_wndproc = int(previous_wndproc)
-        self._native_wndproc = custom_wndproc
+                make_window_minimizable(hwnd, ctypes.windll.user32)
+            except (AttributeError, OSError):
+                pass
+        if not self._taskbar_button_ready:
+            self.after(50, self._set_appwindow_style)
 
     def _build_profiles_page(self) -> None:
         page = self._new_page("profiles")

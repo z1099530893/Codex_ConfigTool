@@ -1,8 +1,13 @@
 #define MyAppName "Codex 配置助手"
 #define MyAppPublisher "k.x"
-#define MyAppExeName "CodexConfigTool.exe"
+#ifndef MyAppExeName
+  #define MyAppExeName "CodexConfigTool.exe"
+#endif
 #ifndef MyAppVersion
-  #define MyAppVersion "1.4.0"
+  #define MyAppVersion "1.5.0"
+#endif
+#ifndef MyAppOutputSuffix
+  #define MyAppOutputSuffix ""
 #endif
 
 [Setup]
@@ -19,7 +24,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=CodexConfigTool-Setup-v{#MyAppVersion}
+OutputBaseFilename=CodexConfigTool{#MyAppOutputSuffix}-Setup-v{#MyAppVersion}
 SetupIconFile=..\assets\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
@@ -40,6 +45,15 @@ Name: "chinesesimp"; MessagesFile: "compiler:Default.isl,ChineseSimplifiedOverri
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
+
+[InstallDelete]
+; Tk 版与 Qt 版共用同一个 AppId、同一个安装目录、同一个 AppMutex，它们是同一个应用的两个
+; 前端而不是两个应用。所以换前端安装时必须把另一个前端的 EXE 删掉，否则会留下一个孤儿
+; 可执行文件（用户点开它就跑起了另一个前端，而快捷方式指向的是新的那个）。
+; 这一节在 [Files] 之前执行，随后由 [Files] 装回当前前端的 EXE。
+; 用无条件删两个名字而不是按前端分支，是为了不引入 ISPP 条件编译。
+Type: files; Name: "{app}\CodexConfigTool.exe"
+Type: files; Name: "{app}\CodexConfigTool-Qt.exe"
 
 [Files]
 Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion

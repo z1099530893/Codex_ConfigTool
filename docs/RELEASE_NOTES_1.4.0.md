@@ -49,7 +49,7 @@
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| `CodexConfigTool-Setup-v1.4.0.exe` | 14,113,241 字节 | `f3caa6c2fca63d13dcb57775ff85d6aa0ea898db355b0613f3543456301fab17` |
-| `CodexConfigTool-Portable-v1.4.0.exe` | 12,309,244 字节 | `8dd3c3119e4d82e58e5237ff620cc87d94d3cb9cf3af791867e52c2bc7caabfb` |
+| `CodexConfigTool-Setup-v1.4.0.exe` | 15,304,391 字节 | `c0d90482f360e8ed1a1b9bfdc634ddcd3b6b5e608e9fb71f9511a0d8d4ad37b5` |
+| `CodexConfigTool-Portable-v1.4.0.exe` | 13,538,969 字节 | `a82178a70f12ae537bae86f8f2d31048094040919e2b3d8f2fad960c895e8dce` |
 
-哈希和文件大小以本次重新打包后的实际文件为准。生成方法见项目 README 的“打包”章节。验证环境：Windows 10 x64、Python 3.14、PyInstaller（项目现有便携版）、Inno Setup 6.7.2。Python 语法检查、完整自动化测试和安装器编译检查均通过。
+验证环境：Windows 10 x64、Python 3.12、PyInstaller 6.20.0、Inno Setup 6.7.3。Python 语法检查、完整自动化测试、安装器检查、单文件构建和隔离启动验证均通过。

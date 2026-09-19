@@ -10,6 +10,19 @@ from unittest.mock import patch
 import codex_config_tool as app
 
 
+def newer_release_version() -> str:
+    """A release tag that is strictly newer than the running build.
+
+    Derived from ``APP_VERSION`` on purpose. These tests used to pin
+    "current = 1.4.0, latest = 1.5.0", which stops testing anything the moment
+    the app reaches 1.5.0 - the fetched version is then no longer newer than the
+    current one and the update check correctly returns ``None``. Bumping the
+    major from the live constant keeps the assertion true for every release.
+    """
+    major, _minor, _patch = app.version_tuple(app.APP_VERSION)
+    return f"{major + 1}.0.0"
+
+
 class BackupManagementTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -54,11 +67,12 @@ class BackupManagementTests(unittest.TestCase):
         self.assertEqual("请求失败：***", app.redact_sensitive_text("请求失败：secret-key", ("secret-key",)))
 
     def test_release_parser_detects_newer_semantic_version(self) -> None:
-        release_url = f"{app.PROJECT_URL}/releases/tag/v1.5.0"
-        update = app.parse_latest_release_url(release_url, current_version="1.4.0")
-        self.assertEqual("1.5.0", update.version)
+        newer = newer_release_version()
+        release_url = f"{app.PROJECT_URL}/releases/tag/v{newer}"
+        update = app.parse_latest_release_url(release_url, current_version=app.APP_VERSION)
+        self.assertEqual(newer, update.version)
         self.assertEqual(release_url, update.page_url)
-        self.assertIsNone(app.parse_latest_release_url(release_url, current_version="1.5.0"))
+        self.assertIsNone(app.parse_latest_release_url(release_url, current_version=newer))
 
     def test_release_parser_rejects_invalid_version(self) -> None:
         invalid_urls = (
@@ -73,6 +87,7 @@ class BackupManagementTests(unittest.TestCase):
 
     def test_fetch_latest_release_reads_github_release_redirect_without_page_download(self) -> None:
         calls = {}
+        newer = newer_release_version()
 
         class Opener:
             def open(self, request, timeout):
@@ -84,14 +99,14 @@ class BackupManagementTests(unittest.TestCase):
                     request.full_url,
                     302,
                     "Found",
-                    {"Location": f"{app.PROJECT_URL}/releases/tag/v1.5.0"},
+                    {"Location": f"{app.PROJECT_URL}/releases/tag/v{newer}"},
                     None,
                 )
 
         with patch.object(app.urllib.request, "build_opener", return_value=Opener()) as builder:
             update = app.fetch_latest_release(timeout=2.5)
 
-        self.assertEqual("1.5.0", update.version)
+        self.assertEqual(newer, update.version)
         self.assertEqual(app.LATEST_RELEASE_PAGE_URL, calls["url"])
         self.assertEqual("HEAD", calls["method"])
         self.assertEqual(2.5, calls["timeout"])
@@ -153,6 +168,57 @@ class BackupManagementTests(unittest.TestCase):
 
         self.assertIn(("style", 42, -20, 0x00040000), calls)
         self.assertIn(("position", 42, 0x0027), calls)
+
+    def test_ensure_taskbar_button_requests_shell_tab(self) -> None:
+        calls = []
+
+        class TaskbarList:
+            def add_tab(self, hwnd):
+                calls.append(hwnd)
+                return True
+
+        self.assertTrue(app.ensure_taskbar_button(4242, TaskbarList()))
+        self.assertEqual([4242], calls)
+
+    def test_ensure_taskbar_button_ignores_missing_handle(self) -> None:
+        calls = []
+
+        class TaskbarList:
+            def add_tab(self, hwnd):
+                calls.append(hwnd)
+                return True
+
+        self.assertFalse(app.ensure_taskbar_button(0, TaskbarList()))
+        self.assertEqual([], calls)
+
+    def test_ensure_taskbar_button_survives_shell_failure(self) -> None:
+        class TaskbarList:
+            def add_tab(self, hwnd):
+                raise OSError("shell unavailable")
+
+        self.assertFalse(app.ensure_taskbar_button(7, TaskbarList()))
+
+    def test_window_helpers_reject_invalid_handles(self) -> None:
+        self.assertFalse(app.minimize_toplevel_window(0))
+        self.assertEqual(0, app.resolve_toplevel_hwnd(0))
+
+    def test_main_window_never_toggles_overrideredirect_at_runtime(self) -> None:
+        """Regression guard for the duplicate native title bar.
+
+        Disabling ``overrideredirect`` while minimizing is what produced a second
+        (native) title bar after a taskbar restore.  The main window must stay
+        borderless for its whole lifetime; only dialogs and the toast may opt in
+        or out.
+        """
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("overrideredirect(False)", source)
+        window_init = source.split("class CodexConfigApp", 1)[1].split("def _load_ui_image", 1)[0]
+        self.assertIn("overrideredirect(True)", window_init)
+
+    def test_minimize_button_drives_win32_instead_of_iconify(self) -> None:
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        minimize_body = source.split("def _minimize_window(self)", 1)[1].split("def ", 1)[0]
+        self.assertIn("minimize_toplevel_window", minimize_body)
 
     def test_codex_restart_target_uses_packaged_root_process(self) -> None:
         package_root = Path(

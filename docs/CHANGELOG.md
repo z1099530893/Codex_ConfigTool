@@ -1,8 +1,50 @@
 # 变更摘要
 
-## 开发中
+## 1.5.0
 
-- 暂无
+### 新增 Qt 前端
+
+- 新增功能与界面完全一致的 Qt（PySide6）前端 `codex_config_qt.py`，复用主程序的全部业务逻辑，只重写视图层
+- 消除「从任务栏恢复窗口时闪一下」的问题：Tk 顶层窗口没有 backing store，恢复时先呈现后绘制，中间 1-3 帧由合成器用窗口背景色填充；Qt 的顶层窗口同时具备表面与 backing store，实测同样 8 轮最小化/恢复中 **0 帧空白**（Tk 为 8/8 闪、12/241 空白帧）
+- 压平 `Canvas`、`WS_EX_LAYERED`、`WS_EX_COMPOSITED` 三种方案均已实测排除，原因与数据见 `AGENT_HANDOFF_WINDOW_BUGS.md`
+- 两种前端共用同一个安装标识、安装目录和用户设置，可随时换用而不影响已有配置
+- 新增 Qt 版 PyInstaller 配置与构建脚本；两个前端的产物互不覆盖
+- 新增闪烁与窗口行为的测量工具集 `prototypes/`，可复现全部结论
+
+### 无边框主窗口（最小化 / 任务栏 / 标题栏）
+
+- 修复最小化后从任务栏恢复时同时出现 Windows 原生标题栏和自绘黑色标题栏的问题
+- 主窗口在整个生命周期内保持无边框：不再在最小化时切换 `overrideredirect`，因此不会重建窗口、不会重新出现原生边框
+- 最小化改为对真实顶层 HWND 调用 `ShowWindow(SW_MINIMIZE)`，进程保持存活，任务栏按钮保持不变
+- 通过 `ITaskbarList::AddTab` 为无边框窗口注册任务栏按钮，正常、最小化、恢复三种状态都可见；不再依赖“隐藏再显示窗口”让 Shell 重新识别
+- 修正窗口句柄解析：`winfo_id()` 返回的是 Tk 内部子窗口，任务栏与最小化相关操作统一作用于它的根祖先窗口（`TkTopLevel`）
+- 补齐 `GetParent`/`PostMessageW` 的 Win32 参数类型；此前句柄被按 32 位整数截断，最小化和任务栏恢复消息实际没有生效
+- 重复最小化/恢复不再改变窗口尺寸，稳定保持 `820x500`
+- 拖动自绘窗口改用向顶层 HWND 发送 `WM_NCLBUTTONDOWN/HTCAPTION`，不再在鼠标移动期间高频重设 Tk 几何尺寸，修复界面破碎
+- 撤回动态 Win32 边框/尺寸补偿和自定义 WndProc 方案（后者曾触发 Python GIL 崩溃），改为在初始化阶段抵消外框宽度偏差
+- 保留 `WS_MINIMIZEBOX`、系统菜单和任务栏窗口样式，修复任务栏按钮无法切换显示/最小化的问题
+- 恢复窗口时在同一个顶层 HWND 上原地重新应用 `WS_EX_APPWINDOW`，修复配置切换重启 Codex 后任务栏图标消失
+- 主窗口不可最大化：补齐对 `SC_MAXIMIZE` 的拦截，并避免在最小化状态下误触发守卫
+- 移除历史实验代码：`WM_NCCALCSIZE` 子窗口过程替换、`WS_POPUP`/`WS_EX_TOOLWINDOW` 样式切换、`<Map>`/`<Unmap>` 帧恢复逻辑
+- 新增窗口生命周期自动化验证脚本（`prototypes/`）与 6 条回归用例，覆盖“不切换 overrideredirect”“最小化走 Win32”“任务栏按钮注册”等关键约束
+
+### 界面细节
+
+- 修复确认对话框的「是/否」按钮左右颠倒：Tk 的 `pack(side="right")` 把先创建的控件放在最右，Qt 的 `QHBoxLayout` 从左往右追加，两个工具链对「第一个」的定义相反；该差异适用于每一个右对齐按钮对
+- 修正表格区域整体上移 9px：Tk 按 `linespace`、`QLabel` 按 `height()` 计算标签盒子高度，差在「每行」
+- 修正 `panelHeading` 字号：角色未指定 `font-size` 时继承基础样式 9pt，而 Tk 用 8pt 粗体绘制
+- 修复自动换行文本被截断在句子中间：`QLabel.setWordWrap(True)` 在祖先面板为 `QSizePolicy.Fixed` 时只按 `sizeHint()` 给一行高度
+- 五页版面全部对齐，`worst |dy| = 0px`
+
+### 构建与安装
+
+- 修复安装版构建批处理窗口过早关闭的问题；构建完成后显示全部产物的完整输出路径，并保留窗口供用户查看
+- `scripts\build.bat` 现在作为统一入口，一次生成 Tk 与 Qt 的便携版和安装版共四个资产，并输出每个资产的字节数与 SHA-256
+- 三个 PowerShell 构建脚本改为显式验证解释器（同时具备 tkinter、PySide6、PyInstaller），不再信任 PATH 上的第一个 `python`——本机 PATH 上的那个没有 tkinter，构建不会报错，失败会推迟到运行期
+- 修复 Qt 安装包文件名缺少连字符（`CodexConfigToolQt-Setup-…`）
+- 新增 `[InstallDelete]` 段：两个前端共用同一个安装标识和目录，换前端安装时清理另一个前端的 EXE，避免留下孤儿可执行文件
+- 修复 `.spec` 通配忽略规则导致 `CodexConfigTool-Qt.spec` 未被纳入版本控制的问题；该文件是 Qt 构建的必需输入，此前从新克隆的仓库无法构建 Qt 前端
+- 版本号全线升到 `1.5.0`：主程序、Windows 版本资源、安装器定义、README 与发布说明
 
 ## 1.4.0
 

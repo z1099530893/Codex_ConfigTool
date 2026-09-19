@@ -1,10 +1,21 @@
 # Codex 配置助手
 
-Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库、Tkinter 和 PyInstaller。启动时会访问 GitHub Release 检查新版本；只有用户主动点击“获取模型”时，才会将 API Key 发送到用户填写的 Base URL，API Key 不会发送到 GitHub 或其他服务。
+Codex 配置助手 `1.5.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库，界面由 Tkinter 或 PySide6（Qt）提供，使用 PyInstaller 打包。启动时会访问 GitHub Release 检查新版本；只有用户主动点击“获取模型”时，才会将 API Key 发送到用户填写的 Base URL，API Key 不会发送到 GitHub 或其他服务。
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版。推荐使用 `CodexConfigTool-Setup-v1.4.0.exe` 安装包；仍提供 `CodexConfigTool-Portable-v1.4.0.exe` 便携版，无需安装。
+前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版。同一个版本提供两种前端，功能与界面完全一致，区别只在窗口渲染方式：
+
+| 文件 | 前端 | 说明 |
+| --- | --- | --- |
+| `CodexConfigTool-Qt-Setup-v1.5.0.exe` | Qt | **推荐**。修复了从任务栏恢复窗口时的闪烁，约 54 MB |
+| `CodexConfigTool-Qt-Portable-v1.5.0.exe` | Qt | 便携版，无需安装 |
+| `CodexConfigTool-Setup-v1.5.0.exe` | Tk | 体积小（约 13 MB），仍存在恢复时的闪烁 |
+| `CodexConfigTool-Portable-v1.5.0.exe` | Tk | 便携版，无需安装 |
+
+两种前端共用同一个安装标识和安装目录，安装其中一个会替换另一个，不会并存。
+
+本版变更详见 [发布说明](docs/RELEASE_NOTES_1.5.0.md)，全部已知缺陷及其状态见 [问题台账](docs/ISSUE_LEDGER.md)。
 
 安装包默认安装到当前用户目录，不要求管理员权限，并创建开始菜单入口。桌面快捷方式默认勾选，也可以在安装时取消。卸载时可以选择“保留用户数据”或“完全删除用户数据”；后者只删除配置助手设置和 `.codex\\backups` 配置库，不删除当前配置、API Key、会话或聊天记录。
 
@@ -32,6 +43,7 @@ Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切�
 - 配置与设置采用原子写入，双文件保存失败时自动恢复原内容
 - 配置签名和搜索信息按文件状态缓存，配置变化后自动失效
 - 固定 `820 × 500` 窗口、扁平化界面、深色自定义标题栏和 Windows 任务栏动画
+- 提供 Tk 与 Qt 两种前端，功能与界面完全一致，共用同一份配置和设置，可随时换用
 
 ## 界面预览
 
@@ -100,7 +112,7 @@ Codex 配置助手 `1.4.0` 是一个 Windows 桌面工具，用于管理和切�
   </tr>
   <tr>
     <td><img src="docs/images/about-dialog.png" alt="关于软件窗口" width="400"></td>
-    <td><img src="docs/images/donation-dialog-v1.4.0.png" alt="赞赏作者窗口" width="400"></td>
+    <td><img src="docs/images/donation-dialog.png" alt="赞赏作者窗口" width="400"></td>
   </tr>
 </table>
 
@@ -147,86 +159,94 @@ python codex_config_tool.py
 
 本项目运行时只依赖 Python 标准库。
 
+### Qt 前端（可选）
+
+仓库里还有一份功能完全相同、界面完全相同的 Qt 前端：
+
+```powershell
+pip install "PySide6>=6.8,<6.12"
+python codex_config_qt.py
+```
+
+它复用 `codex_config_tool.py` 的全部业务逻辑（配置读写、配置库、进程处理、更新检查等），只重写视图层。注意该模块会导入 `tkinter`，因此所用解释器需要**同时**具备 `PySide6` 和 `tkinter`。
+
+**为什么会有两个前端**：从任务栏恢复窗口时，Tk 前端的主界面会闪一下——顶层窗口先被呈现、内容后绘制，中间 1-3 帧由合成器用窗口自身的背景色填充。Tk 的顶层窗口没有 backing store，把整个视图压到一个 `Canvas` 只能减少约三分之一、无法消除。Qt 的顶层窗口两者兼备，实测同样 8 轮最小化/恢复中 **0 帧空白**。原因、测量方法与数据见 `AGENT_HANDOFF_WINDOW_BUGS.md`，可复现的测量工具在 `prototypes/`。
+
+### 打包 Qt 前端
+
+```bat
+scripts\build_qt.bat
+```
+
+产物是 `dist\CodexConfigTool-Qt.exe`（约 51 MB），**不会覆盖** `dist\CodexConfigTool.exe`。两者并存是刻意的：Tk 版是回滚产物，构建脚本会在结束时核对 Tk 产物的哈希，一旦被改动就报错。
+
+体积明显大于 Tk 版的 12.6 MB，原因有两条，都不是可以省掉的：需要打包 Qt 运行时；而且 `codex_config_tool.py` 在模块顶层 `import tkinter`，Qt 前端把它整个当作库导入，所以连 tkinter 与 tcl/tk 也一并打包。这是“共用业务逻辑”这个架构的直接代价。
+
+`scripts\build_qt.ps1` 会显式挑选同时具备 PySide6、tkinter、PyInstaller 的解释器，而不是信任 PATH 上的第一个 `python`——本机 PATH 上的那个没有 tkinter，跑不起本项目。
+
 ## 测试
 
 ```powershell
-python -m py_compile codex_config_tool.py
+python -m py_compile codex_config_tool.py codex_config_qt.py
 python -m unittest discover -s tests -q
 ```
 
-测试使用临时配置目录，不读取或修改真实用户的 `.codex`。测试覆盖写入故障注入、事务回滚、缓存失效、模型目录、配置切换生命周期、官方登录会话保护和安装包数据边界。
+测试使用临时配置目录，不读取或修改真实用户的 `.codex`。测试覆盖写入故障注入、事务回滚、缓存失效、模型目录、配置切换生命周期、官方登录会话保护和安装包数据边界。当前为 **124 项**，全部通过。
+
+窗口相关的结论**不能只看测试**：本项目为此维护了一套可复现的测量工具（`prototypes/`）和一份完整的调查记录（`AGENT_HANDOFF_WINDOW_BUGS.md`），改动窗口、任务栏或系统托盘代码前请先读它们。
 
 ## 打包
 
-关闭正在运行的程序后执行。以下命令需要在项目根目录运行；构建前请确认已安装 Python 3.10+，并且已经安装依赖：
-
-```powershell
-python -m pip install pyinstaller
-```
-
-### 手动打包便携版
-
-便携版是单文件 EXE，不需要安装。执行：
+关闭正在运行的程序并安装 Inno Setup 6 后，执行统一打包入口：
 
 ```bat
 scripts\build.bat
 ```
 
-或：
+该脚本一次生成**四个**发布资产——两种前端各自的便携版与安装版：
+
+| 文件 | 前端 |
+| --- | --- |
+| `dist\CodexConfigTool-Portable-v<版本>.exe` | Tk |
+| `dist\CodexConfigTool-Setup-v<版本>.exe` | Tk |
+| `dist\CodexConfigTool-Qt-Portable-v<版本>.exe` | Qt |
+| `dist\CodexConfigTool-Qt-Setup-v<版本>.exe` | Qt |
+
+完成或失败时命令行窗口会保留并显示结果，成功时逐个输出字节数与 SHA-256。开发者如需单独调用底层流程：
 
 ```powershell
-.\scripts\build.ps1
+.\scripts\build_installer.ps1          # 四个资产
+.\scripts\build.ps1                    # 只出 Tk 便携版
+.\scripts\build_qt.ps1                 # 只出 Qt 便携版
+.\scripts\build_installer.ps1 -SkipBuild -SkipQt   # 只重打 Tk 安装包
 ```
 
-构建完成后，便携版位于 `dist/CodexConfigTool.exe`。发布时建议复制为带版本号的文件名：
+`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。安装器定义 `packaging\CodexConfigTool.iss` 通过 ISPP 参数复用：`build_installer.ps1` 调用 ISCC 两次，分别以 `/DMyAppExeName=CodexConfigTool.exe` 和 `/DMyAppExeName=CodexConfigTool-Qt.exe /DMyAppOutputSuffix=-Qt` 传入。两种前端共用同一个 `AppId`、`AppMutex` 和安装目录，它们是同一个应用的两个前端而不是两个应用，因此安装器带一个 `[InstallDelete]` 段，换前端安装时清掉另一个前端的 EXE。
 
-```powershell
-$version = (Select-String -Path .\codex_config_tool.py -Pattern '^APP_VERSION\s*=\s*"([0-9.]+)"$').Matches[0].Groups[1].Value
-Copy-Item .\dist\CodexConfigTool.exe ".\dist\CodexConfigTool-Portable-v$version.exe" -Force
-Get-FileHash ".\dist\CodexConfigTool-Portable-v$version.exe" -Algorithm SHA256
-```
-
-### 手动打包安装版
-
-安装版使用 Inno Setup 6 将 `dist\CodexConfigTool.exe` 包装为安装程序。先安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)，然后执行：
-
-```bat
-scripts\build_installer.bat
-```
-
-或：
-
-```powershell
-.\scripts\build_installer.ps1
-```
-
-如果已经有用户自己打包好的便携版，只生成安装版时可以跳过便携版构建：
-
-```powershell
-Copy-Item .\dist\CodexConfigTool-Portable-v<版本>.exe .\dist\CodexConfigTool.exe -Force
-.\scripts\build_installer.ps1 -SkipPortableBuild
-```
-
-也可以直接调用 Inno Setup 编译器（默认安装路径如下）：
-
-```powershell
-& 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /DMyAppVersion=<版本> .\packaging\CodexConfigTool.iss
-```
-
-最终发布产物为 `dist/CodexConfigTool-Portable-v<版本>.exe` 和 `dist/CodexConfigTool-Setup-v<版本>.exe`。使用 `Get-FileHash <文件> -Algorithm SHA256` 核对哈希后，再将两个 EXE 一起上传到 GitHub Release。`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。源码仓库只提交源码、文档、测试、构建脚本和图片资源；生成的 EXE 应作为 GitHub Release 附件发布，不提交到源码仓库。
+源码仓库只提交源码、文档、测试、构建脚本和图片资源；生成的 EXE 应作为 GitHub Release 附件发布，不提交到源码仓库。
 
 ## 文件结构
 
 ```text
-codex_config_tool.py   主程序
-tests/                 标准库测试
-assets/               图片、图标和赞赏码
-scripts/              构建脚本和测试补丁脚本
-packaging/            Inno Setup 安装包定义
-docs/                 项目说明、交接文档和变更记录
-docs/images/          README 使用的界面截图
-version_info.txt       Windows EXE 版本资源
+codex_config_tool.py           主程序（Tk 前端 + 全部业务逻辑）
+codex_config_qt.py             Qt（PySide6）前端，复用上面的业务逻辑
+CodexConfigTool.spec           Tk 版 PyInstaller 配置
+CodexConfigTool-Qt.spec        Qt 版 PyInstaller 配置（build_qt.ps1 必需）
+prototypes/                    闪烁问题的测量工具与原型（见其 README）
+tests/                         标准库测试
+assets/                        图片、图标和赞赏码
+scripts/                       构建脚本和测试补丁脚本
+packaging/                     Inno Setup 安装包定义
+docs/                          项目说明、交接文档和变更记录
+docs/ISSUE_LEDGER.md           全部已知缺陷及其状态
+docs/RELEASE_NOTES_1.5.0.md    本版发布说明
+docs/ai/                       开发过程记录（变更请求、开发日志、验收与发布报告）
+docs/images/                   README 使用的界面截图
+AGENT_HANDOFF_WINDOW_BUGS.md   窗口问题的完整调查记录（改窗口代码前先读）
+version_info.txt               Windows EXE 版本资源
 ```
+
+`.gitignore` 有意排除以下内容，它们都是本地安全网或可再生产物，不进入仓库：`build/`、`dist/`、`backups/`（约 95 MB 的回滚快照与历史 EXE）、`prototypes/out/`（约 33 MB 的截图与测量报告，重跑探针即可再生）、`.workbuddy-ai/`，以及误展开的 `%SystemDrive%/` 目录。
 
 ## 联系
 

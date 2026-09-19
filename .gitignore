@@ -5,7 +5,13 @@ __pycache__/
 # PyInstaller output
 build/
 dist/
-*.spec
+
+# PyInstaller specs written by one-off preview builds. These are throwaway
+# generated files, so they are ignored by name rather than by "*.spec".
+# CodexConfigTool.spec and CodexConfigTool-Qt.spec are deliberately NOT ignored:
+# scripts\build_qt.ps1 loads CodexConfigTool-Qt.spec and throws if it is missing,
+# so ignoring all specs would make the Qt front end unbuildable from a fresh clone.
+CodexConfigTool-Preview-*.spec
 
 # Local test folders
 tmp_test*/
@@ -27,6 +33,23 @@ Desktop.ini
 # Codex/runtime local folders
 .agents/
 .codex/
+
+# Rollback snapshots and superseded release binaries.
+# These are the local safety net, not sources: roughly 95 MB of mostly EXE copies.
+backups/
+
+# Measurement artefacts written by prototypes/*.py.
+# Screenshots and JSON reports, ~33 MB, fully regenerable by re-running the probes.
+# The probe scripts themselves are tracked - they are this project's verification
+# harness and the evidence behind every layout and flash claim.
+prototypes/out/
+
+# Assistant working data (session memory, local skill copies).
+.workbuddy-ai/
+
+# Image-Management is an unrelated project that happens to live in this directory.
+# It has its own .git and its own history; it must never enter this repository.
+Image-Management/
 
 # Misexpanded Windows environment paths created by isolated tests
 %SystemDrive%/
