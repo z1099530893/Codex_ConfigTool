@@ -184,11 +184,13 @@ Tk 顶层窗口没有 backing store：恢复时窗口先被呈现、内容后绘
 
 | 问题 | 根因 | 状态 |
 | --- | --- | --- |
-| 构建脚本可能产出跑不起来的包 | `build.ps1` 信任 PATH 上的第一个 `python`，本机那个**没有 tkinter**；PyInstaller 不会在构建时报错，失败**推迟到运行期** | **已修复**：三个脚本都改为显式验证解释器（按退出码判定，不抓 stdout） |
+| 构建脚本可能产出跑不起来的包 | `build.ps1` 信任 PATH 上的第一个 `python`，本机那个**没有 tkinter**；PyInstaller 不会在构建时报错，失败**推迟到运行期** | **已修复**：脚本改为显式验证解释器（按退出码判定，不抓 stdout） |
 | **`.spec` 被 `.gitignore` 忽略，但 `build_qt.ps1` 依赖它** | 旧的 `*.spec` 通配规则把手工维护的 `CodexConfigTool-Qt.spec` 也吞了，而 `build_qt.ps1` 在找不到它时直接 `throw` | **已修复**：改为按名忽略 `CodexConfigTool-Preview-*.spec`，两个正式 spec 纳入版本控制 |
-| 一次构建只能出一个包 | 安装脚本只打 Tk 包 | **已修复**：`build_installer.ps1` 一次产出四个资产 |
-| Qt 安装包文件名缺连字符 | `/DMyAppOutputSuffix=Qt` 直接拼接 | **已修复**：改为 `-Qt` |
-| 换前端安装后残留孤儿 EXE | 两个前端共用 `AppId`/`AppMutex`/`DefaultDirName`，是同一个应用的两个前端而非两个应用 | **已修复**：新增 `[InstallDelete]` 段 |
+| 一次构建只能出一个包 | 安装脚本只打 Tk 包 | **已修复**：`build_installer.ps1` 一次产出两个资产 |
+| Qt 安装包文件名缺连字符 | `/DMyAppOutputSuffix=Qt` 直接拼接 | **已修复**：改为 `-Qt`；本版单前端发布后该宏已移除 |
+| 换前端安装后残留孤儿 EXE | 两个前端共用 `AppId`/`AppMutex`/`DefaultDirName`，是同一个应用的两个前端而非两个应用 | **已修复**：`[InstallDelete]` 段覆盖 `CodexConfigTool.exe` 与 `CodexConfigTool-Qt.exe` 两个历史名字 |
+| 构建产物名与安装后名字被迫绑在一起 | 两个前端并存时，Qt 产物必须叫 `CodexConfigTool-Qt.exe` 才不会覆盖 Tk 回滚产物；但安装后的名字必须是 `CodexConfigTool.exe`，否则快捷方式、`AppMutex`、`UninstallDisplayIcon` 全要跟着改 | **已修复**：拆成 `MyAppSourceExe` / `MyAppExeName` 两个宏，`[Files]` 用 `DestName` 改名。`DestName` 的改名语义已用一个一次性安装器（独立 `AppId`、`Uninstallable=no`、装到临时目录）实测确认，不是照文档推断 |
+| 发布页同时提供有缺陷的前端 | 把 Tk 版和修好的 Qt 版并排放着，等于给用户一个选中坏版本的机会 | **已修复**：自 1.5.0 起只发布 Qt 版；Tk 视图层保留在源码中（Qt 版依赖它作为业务逻辑库），`build.ps1` 降级为回滚/对照用途 |
 | 版本号升到 1.5.0 后测试失败 | 测试硬编码 `1.4.0`/`1.5.0`，应用升到 1.5.0 后「最新版」不再比当前版本新，更新检查正确地返回 `None` | **已修复**：新增 `newer_release_version()` 从 `app.APP_VERSION` 推导 |
 | PowerShell 脚本乱码/解析失败 | Windows PowerShell 5.1 对没有 UTF-8 BOM 的 `.ps1` 按 ANSI 解码 | **已修复**：三个 `.ps1` 保持纯 ASCII，并用解析器校验而非肉眼阅读 |
 

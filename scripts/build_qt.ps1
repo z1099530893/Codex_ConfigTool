@@ -18,7 +18,7 @@
       trusting the first python on PATH.
 
     * It does not build an installer by itself. build_installer.ps1 calls this script
-      and then runs ISCC twice, once per front end, producing all four release assets.
+      and then runs ISCC once, producing the two release assets.
 
     NOTE ON ENCODING: keep this file pure ASCII. Windows PowerShell 5.1 decodes a
     .ps1 as ANSI unless it starts with a UTF-8 BOM, so non-ASCII comments (Chinese,
@@ -111,8 +111,10 @@ if (-not (Test-Path -LiteralPath $distExe)) {
     throw "Expected EXE was not created: $distExe"
 }
 
-# A guard, not a formality: not touching the Tk artifact is the whole reason this
-# script exists separately from build.ps1.
+# A guard, not a formality: dist\CodexConfigTool.exe is the Tk front end's rollback
+# artifact and the only way back if this Qt build turns out to be wrong. A Qt build
+# has no business writing to it, and PyInstaller will silently reuse a name if the
+# spec is ever edited carelessly - so the hash is compared rather than trusted.
 if ($tkExeBefore) {
     $tkExeAfter = (Get-FileHash -LiteralPath $tkExe -Algorithm SHA256).Hash
     if ($tkExeAfter -ne $tkExeBefore) {

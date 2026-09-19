@@ -1,21 +1,23 @@
 param(
     [switch]$SkipBuild,
-    [switch]$SkipQt,
     [string]$PythonPath = "",
     [string]$IsccPath = ""
 )
 
-# Release builder: produces the four assets that go on the GitHub release page.
+# Release builder: produces the two assets that go on the GitHub release page.
 #
-#   dist\CodexConfigTool-Portable-v<ver>.exe      Tk  front end, portable
-#   dist\CodexConfigTool-Setup-v<ver>.exe         Tk  front end, installer
-#   dist\CodexConfigTool-Qt-Portable-v<ver>.exe   Qt  front end, portable
-#   dist\CodexConfigTool-Qt-Setup-v<ver>.exe      Qt  front end, installer
+#   dist\CodexConfigTool-Portable-v<ver>.exe   portable, no install needed
+#   dist\CodexConfigTool-Setup-v<ver>.exe      installer
 #
-# The two front ends share one AppId, one install directory and one AppMutex, so
-# they are two front ends of one application rather than two applications. The
-# installer definition therefore takes the EXE name and the output-name suffix as
-# parameters instead of hardcoding the Tk one.
+# Both are built from the Qt (PySide6) front end. Since v1.5.0 that is the only
+# front end that ships: the Tk front end cannot be made to stop flashing when the
+# window is restored from the taskbar, so publishing it next to the fixed one only
+# gives users a way to pick the broken build.
+#
+# The Tk view layer still lives in codex_config_tool.py, and it has to: that module
+# is also the shared business logic that codex_config_qt.py imports. Retiring the Tk
+# *release* is not the same as deleting the Tk *code*. scripts\build.ps1 still builds
+# a Tk EXE for development and rollback purposes, but nothing here calls it.
 #
 # NOTE ON ENCODING: keep this file pure ASCII. Windows PowerShell 5.1 decodes a .ps1
 # as ANSI unless it starts with a UTF-8 BOM, so non-ASCII comments get misread and can
@@ -27,7 +29,7 @@ $sourceFile = Join-Path $projectRoot "codex_config_tool.py"
 $distDir = Join-Path $projectRoot "dist"
 $installerScript = Join-Path $projectRoot "packaging\CodexConfigTool.iss"
 
-$tkExe = Join-Path $distDir "CodexConfigTool.exe"
+# Build artifact name. The installer renames it to CodexConfigTool.exe on install.
 $qtExe = Join-Path $distDir "CodexConfigTool-Qt.exe"
 
 # --------------------------------------------------------------------------- #
@@ -44,12 +46,10 @@ Write-Host "[INFO] Version: $appVersion"
 # Interpreter: pick one that can actually build. The interpreter first on PATH on
 # this machine has no tkinter, and this project's shared module imports tkinter at
 # module level, so an unverified choice produces a broken EXE rather than an error.
+# All three of tkinter, PySide6 and PyInstaller must be present.
 # --------------------------------------------------------------------------- #
 if (-not $PythonPath) {
-    $probe = "import tkinter, PyInstaller"
-    if (-not $SkipQt) {
-        $probe = "import tkinter, PyInstaller, PySide6"
-    }
+    $probe = "import tkinter, PyInstaller, PySide6"
     $candidates = @()
     $candidates += "C:\Program Files\Develop\Python\python.exe"
     foreach ($name in @("python.exe", "python3.exe")) {
@@ -76,30 +76,18 @@ if (-not $PythonPath) {
 Write-Host "[INFO] Interpreter: $PythonPath"
 
 # --------------------------------------------------------------------------- #
-# Build the two EXEs.
+# Build the EXE.
 # --------------------------------------------------------------------------- #
 if (-not $SkipBuild) {
     Write-Host ""
-    Write-Host "[STEP] Building the Tk front end..."
-    & (Join-Path $PSScriptRoot "build.ps1") -PythonPath $PythonPath
+    Write-Host "[STEP] Building the Qt front end..."
+    & (Join-Path $PSScriptRoot "build_qt.ps1") -PythonPath $PythonPath
     if ($LASTEXITCODE -ne 0) {
-        throw "Tk EXE build failed."
-    }
-
-    if (-not $SkipQt) {
-        Write-Host ""
-        Write-Host "[STEP] Building the Qt front end..."
-        & (Join-Path $PSScriptRoot "build_qt.ps1") -PythonPath $PythonPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "Qt EXE build failed."
-        }
+        throw "Qt EXE build failed."
     }
 }
 
-if (-not (Test-Path -LiteralPath $tkExe)) {
-    throw "Tk EXE was not found: $tkExe"
-}
-if (-not $SkipQt -and -not (Test-Path -LiteralPath $qtExe)) {
+if (-not (Test-Path -LiteralPath $qtExe)) {
     throw "Qt EXE was not found: $qtExe"
 }
 
@@ -140,57 +128,44 @@ if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath)) {
 }
 
 # --------------------------------------------------------------------------- #
-# Portable assets: the EXEs are already single-file, so the portable release is a
+# Portable asset: the EXE is already single-file, so the portable release is a
 # copy under the versioned name.
 # --------------------------------------------------------------------------- #
-$tkPortable = Join-Path $distDir "CodexConfigTool-Portable-v$appVersion.exe"
-Copy-Item -LiteralPath $tkExe -Destination $tkPortable -Force
-$produced = @($tkPortable)
-
-if (-not $SkipQt) {
-    $qtPortable = Join-Path $distDir "CodexConfigTool-Qt-Portable-v$appVersion.exe"
-    Copy-Item -LiteralPath $qtExe -Destination $qtPortable -Force
-    $produced += $qtPortable
-}
+$portable = Join-Path $distDir "CodexConfigTool-Portable-v$appVersion.exe"
+Copy-Item -LiteralPath $qtExe -Destination $portable -Force
+$produced = @($portable)
 
 # --------------------------------------------------------------------------- #
-# Installers. The Qt pass overrides the EXE name and the output-name suffix; the
-# AppId and install directory stay shared on purpose.
+# Installer. One ISCC pass; the EXE name and output name come from the .iss defaults.
 # --------------------------------------------------------------------------- #
 Write-Host ""
-Write-Host "[STEP] Building the Tk installer..."
+Write-Host "[STEP] Building the installer..."
 & $IsccPath "/DMyAppVersion=$appVersion" $installerScript
 if ($LASTEXITCODE -ne 0) {
-    throw "Tk installer build failed."
+    throw "Installer build failed."
 }
-$tkSetup = Join-Path $distDir "CodexConfigTool-Setup-v$appVersion.exe"
-if (-not (Test-Path -LiteralPath $tkSetup)) {
-    throw "Expected installer was not created: $tkSetup"
+$setup = Join-Path $distDir "CodexConfigTool-Setup-v$appVersion.exe"
+if (-not (Test-Path -LiteralPath $setup)) {
+    throw "Expected installer was not created: $setup"
 }
-$produced += $tkSetup
-
-if (-not $SkipQt) {
-    Write-Host ""
-    Write-Host "[STEP] Building the Qt installer..."
-    & $IsccPath "/DMyAppVersion=$appVersion" "/DMyAppExeName=CodexConfigTool-Qt.exe" "/DMyAppOutputSuffix=-Qt" $installerScript
-    if ($LASTEXITCODE -ne 0) {
-        throw "Qt installer build failed."
-    }
-    $qtSetup = Join-Path $distDir "CodexConfigTool-Qt-Setup-v$appVersion.exe"
-    if (-not (Test-Path -LiteralPath $qtSetup)) {
-        throw "Expected installer was not created: $qtSetup"
-    }
-    $produced += $qtSetup
-}
+$produced += $setup
 
 # --------------------------------------------------------------------------- #
 # Report. The hashes go straight into the release notes, so print them rather than
-# making the next person compute them by hand.
+# making the next person compute them by hand. The same lines are also written to
+# build\release-assets.txt: console scrollback is lost the moment the window closes,
+# and a release note that quotes a hash nobody can re-derive is worse than no hash.
 # --------------------------------------------------------------------------- #
 Write-Host ""
 Write-Host "[SUCCESS] Release assets for v$appVersion"
+$report = @()
 foreach ($path in $produced) {
     $item = Get-Item -LiteralPath $path
     $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLower()
-    Write-Host ("  {0}  {1} bytes  {2}" -f $item.Name, $item.Length, $hash)
+    $line = "  {0}  {1} bytes  {2}" -f $item.Name, $item.Length, $hash
+    Write-Host $line
+    $report += "$($item.Name)`n  size=$($item.Length)  hash=$hash"
 }
+$reportPath = Join-Path $projectRoot "build\release-assets.txt"
+Set-Content -LiteralPath $reportPath -Value $report -Encoding UTF8
+Write-Host "[INFO] Report written to $reportPath"

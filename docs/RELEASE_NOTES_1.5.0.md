@@ -1,23 +1,21 @@
 # Codex 配置助手 v1.5.0
 
-本版本修复了无边框主窗口的一系列交互缺陷，并新增一个 **Qt 前端**，用于消除「从任务栏恢复窗口时闪一下」的问题。同一个版本提供两种前端，功能与界面完全一致，区别只在窗口渲染方式。安装版与便携版同时提供。
+本版本修复了无边框主窗口的一系列交互缺陷，并把界面从 Tk 换成 **Qt**，用于消除「从任务栏恢复窗口时闪一下」的问题。**自本版起只发布 Qt 前端**，安装版与便携版同时提供。
 
 ## 下载
 
-两种前端共用同一个安装标识和安装目录，安装其中一个会替换另一个，**不会并存**。
+| 文件 | 说明 |
+| --- | --- |
+| `CodexConfigTool-Setup-v1.5.0.exe` | **推荐**。安装版，创建开始菜单入口，可正常卸载 |
+| `CodexConfigTool-Portable-v1.5.0.exe` | 便携版，无需安装 |
 
-| 文件 | 前端 | 说明 |
-| --- | --- | --- |
-| `CodexConfigTool-Qt-Setup-v1.5.0.exe` | Qt | **推荐**。修复了恢复窗口时的闪烁 |
-| `CodexConfigTool-Qt-Portable-v1.5.0.exe` | Qt | 便携版，无需安装 |
-| `CodexConfigTool-Setup-v1.5.0.exe` | Tk | 体积小，仍存在恢复时的闪烁 |
-| `CodexConfigTool-Portable-v1.5.0.exe` | Tk | 便携版，无需安装 |
+1.4.0 及更早版本发布的是 Tk 前端。升级直接安装 1.5.0 即可：安装器会先删掉旧的 `CodexConfigTool.exe` 再装回同名的 Qt 版，快捷方式、单实例行为和卸载入口都不变；配置、API Key、配置库和设置全部原样保留。
 
 安装包按当前用户安装，支持开始菜单、可选桌面快捷方式和标准卸载流程。
 
 ## 新增与改进
 
-### 新增 Qt 前端，消除恢复窗口时的闪烁
+### 界面从 Tk 换成 Qt，消除恢复窗口时的闪烁
 
 从任务栏恢复窗口时，Tk 前端的主界面会闪一下：顶层窗口先被呈现、内容后绘制，中间 1-3 帧由合成器用窗口自身的背景色填充。**这是 Tk 顶层窗口的结构性限制，不是可以修掉的 bug** —— 它没有 backing store。
 
@@ -35,13 +33,15 @@
 | 闪烁轮次 | 8/8 | **0/8** |
 | 空白帧 | 12/241 | **0/241** |
 
+因为修不掉，本版**不再发布 Tk 前端**：把有缺陷的版本和修好的版本并排放在下载页上，等于给用户一个选中坏版本的机会。Tk 的视图层仍然保留在源码里，这不是念旧——`codex_config_qt.py` 通过 `import codex_config_tool as core` 把这一整个模块当作业务逻辑库使用，**删掉它，Qt 版就起不来**。
+
 Qt 前端复用 `codex_config_tool.py` 的全部业务逻辑（配置读写、配置库、进程处理、更新检查等），只重写视图层。完整的原因分析、测量方法与数据见仓库中的 `AGENT_HANDOFF_WINDOW_BUGS.md`，可复现的测量工具在 `prototypes/`。
 
-体积明显大于 Tk 版，原因有两条，都不是可以省掉的：需要打包 Qt 运行时；而且 `codex_config_tool.py` 在模块顶层 `import tkinter`，Qt 前端把它整个当作库导入，所以连 tkinter 与 tcl/tk 也一并打包。这是「共用业务逻辑」这个架构的直接代价。
+体积约 51 MB，原因有两条，都不是可以省掉的：需要打包 Qt 运行时；而且 `codex_config_tool.py` 在模块顶层 `import tkinter`，Qt 前端把它整个当作库导入，所以连 tkinter 与 tcl/tk 也一并打包。这是「共用业务逻辑」这个架构的直接代价。
 
-### 一次构建产出四个发布包
+### 一次构建产出两个发布包
 
-`scripts\build.bat` 现在是完整的发布入口，一次生成 Tk 与 Qt 的便携版和安装版共四个资产，并输出每个资产的字节数与 SHA-256。三个 PowerShell 脚本都会**显式验证解释器**（同时具备 tkinter、PySide6、PyInstaller），而不是信任 PATH 上的第一个 `python`——本机 PATH 上的那个没有 tkinter，构建不会报错，失败会推迟到运行期。
+`scripts\build.bat` 是完整的发布入口，一次生成便携版和安装版两个资产，并输出每个资产的字节数与 SHA-256（同时写入 `build\release-assets.txt`）。PowerShell 脚本会**显式验证解释器**（同时具备 tkinter、PySide6、PyInstaller），而不是信任 PATH 上的第一个 `python`——本机 PATH 上的那个没有 tkinter，构建不会报错，失败会推迟到运行期。
 
 ## 重要修复
 
@@ -66,7 +66,8 @@ Qt 前端复用 `codex_config_tool.py` 的全部业务逻辑（配置读写、�
 ### 打包与安装
 
 - **修复 Qt 安装包文件名缺少连字符**（`CodexConfigToolQt-Setup-…`）。
-- **换前端安装时清理另一个前端的 EXE**。两个前端共用同一个安装标识和目录，新增 `[InstallDelete]` 段避免留下孤儿可执行文件。
+- **构建产物名与安装后的名字分开**。构建产物是 `dist\CodexConfigTool-Qt.exe`（避免与 Tk 回滚产物撞名），安装后统一落成 `CodexConfigTool.exe`，由安装器 `[Files]` 的 `DestName` 完成改名。这样 1.4.0 用户升级时是原地替换，快捷方式、`AppMutex`、`UninstallDisplayIcon` 和单实例行为都不用改。
+- **清理历史遗留的可执行文件**。`[InstallDelete]` 会删掉 `CodexConfigTool.exe`（1.4.0 及更早装下的 Tk 版）和 `CodexConfigTool-Qt.exe`（v1.5.0 开发期间可能装过的名字），避免留下一个不再更新的孤儿程序。
 - **`.spec` 被 `.gitignore` 忽略，但 Qt 构建脚本依赖它**。旧的 `*.spec` 通配规则会吞掉手工维护的 `CodexConfigTool-Qt.spec`，而 `build_qt.ps1` 在找不到它时直接报错——也就是说**从新克隆的仓库无法构建 Qt 前端**。现改为按名忽略历史预览 spec，两个正式 spec 纳入版本控制。
 
 ## 安装与数据安全
@@ -82,21 +83,19 @@ Qt 前端复用 `codex_config_tool.py` 的全部业务逻辑（配置读写、�
 
 完整功能介绍、全部界面截图、数据边界和已知问题请查看项目 [README](https://github.com/z1099530893/Codex_ConfigTool#readme) 与 [问题台账](https://github.com/z1099530893/Codex_ConfigTool/blob/main/docs/ISSUE_LEDGER.md)。
 
-两种前端的使用方式完全相同，配置与设置也共用同一份，可以随时换用另一个前端而不影响已有配置。
+从 1.4.0 升级不需要做任何事：配置、API Key、配置库和设置都存放在 `%APPDATA%\CodexConfigTool` 与 `.codex\backups`，与程序文件无关，安装新版不会动它们。
 
 ## 文件校验
 
 | 文件 | 大小 | SHA-256 |
 | --- | ---: | --- |
-| `CodexConfigTool-Qt-Setup-v1.5.0.exe` | 54,956,689 字节 | `cdf37d87833431afcfd67ab2e14fa23581e991c7ebab9a829baa05478c8c3599` |
-| `CodexConfigTool-Qt-Portable-v1.5.0.exe` | 53,519,111 字节 | `3e6b85c5be2b438262705df45b59b56881bc144771e2d3fd6c568f2c4919c244` |
-| `CodexConfigTool-Setup-v1.5.0.exe` | 14,961,160 字节 | `572417dbe15baef7f1adffd932620c5112a6e72f92f55f0e0170924188239a25` |
-| `CodexConfigTool-Portable-v1.5.0.exe` | 13,165,940 字节 | `b3f5e179d7d46f9a55d4d07921c341ca6aedf6f9226f61e92d3d4a0ef2f715d9` |
+| `CodexConfigTool-Setup-v1.5.0.exe` | 54,956,911 字节 | `92a43ce0af0d29a4eed31b58051206c79884a4e775bbe19f5063ba04afe134a7` |
+| `CodexConfigTool-Portable-v1.5.0.exe` | 53,519,038 字节 | `70c8448a0926d65a289761101d36a723c4414d662f6a73338c470b6240446399` |
 
-验证环境：Windows、Python 3.13.9、PySide6 6.11.2、PyInstaller 6.22.2、Inno Setup 6。Python 语法检查、124 项自动化测试、四个资产的构建与打包启动验证、隔离启动冒烟和闪烁复测均通过。
+验证环境：Windows 10 19044、Python 3.13.9、PySide6 6.11.2、PyInstaller 6.22.2、Inno Setup 6.7.1。Python 语法检查、127 项自动化测试、两个资产的构建、打包启动验证（8/8）、隔离启动冒烟，以及在**本次构建的字节上**重跑的恢复闪烁复测（8 轮，`blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`）均通过。
 
 ## 已知问题
 
-- **Tk 前端仍存在恢复窗口时的闪烁**，这是 Tk 顶层窗口的结构性限制，无法在本项目范围内消除。请使用 Qt 前端。
 - 与 Tk 版相比有 5 处像素级差异无法表达，均已量化并记录在问题台账的「已知未修」一节，例如表头的 1px 高光/阴影和列分隔线的双色描边。
 - BUG-004（重启 Codex 后系统托盘图标偶发缺失）的修复流程已重做，仍需在真实 Codex 环境确认。
+- Tk 前端（`python codex_config_tool.py`）仍可从源码运行，但不再发布，其恢复窗口时的闪烁依旧存在。

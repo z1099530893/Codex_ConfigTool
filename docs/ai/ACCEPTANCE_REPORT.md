@@ -1,5 +1,20 @@
 # CR-006 模型目录与配置切换验收报告
 
+## 2026-09-19 v1.5.0 单前端发布验证（TEST-009）
+
+- 源码语法检查（`py_compile codex_config_tool.py codex_config_qt.py`）、**127 项标准库测试**通过。
+- 版本源一致：`APP_VERSION`、Windows 版本资源、安装器定义、产物名称与发布说明均为 `1.5.0`。
+- PyInstaller 6.22.2 重建 `dist\CodexConfigTool-Qt.exe` 用 47 秒；Inno Setup 6.7.1 编译安装包通过，日志确认压缩的输入正是 `dist\CodexConfigTool-Qt.exe`。
+- 打包启动验证 **8/8**：窗口类 `Qt6112QWindowIcon`、`820x500`、无原生边框、0 个原生子窗口、`WS_SYSMENU|WS_MINIMIZEBOX` 在位、无分层样式、设置写入隔离 `APPDATA`、真实 `settings.json` 未被触碰。
+- 恢复闪烁复测在**本次构建的字节上**重跑 8 轮（`--strip-top 300 --sidebar-max 120`）：每轮 `blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`；报告 `prototypes/out/flash-qt-exe-v150-rebuilt.json`。写在**新路径**而不是覆盖旧报告——旧记录本身是上一份字节的基线。
+- 发布资产只来自 Qt 前端：
+  - `CodexConfigTool-Setup-v1.5.0.exe`：54,956,911 字节，SHA-256 `92a43ce0af0d29a4eed31b58051206c79884a4e775bbe19f5063ba04afe134a7`
+  - `CodexConfigTool-Portable-v1.5.0.exe`：53,519,038 字节，SHA-256 `70c8448a0926d65a289761101d36a723c4414d662f6a73338c470b6240446399`
+- 两个资产的文件版本资源均为 `filever=1.5.0` / `prodver=1.5.0`，说明为 `Codex 配置助手`（安装包为 `Codex 配置助手 安装程序`）。
+- `DestName` 改名语义实测：一次性安装器（独立 `AppId`、`Uninstallable=no`、`CreateUninstallRegKey=no`、装到 `{tmp}`）把 `version_info.txt` 落成 `ProbeTarget.txt`，日志逐行可见；退出后临时目录与注册表均无残留。
+- 隔离性：本机 `%LOCALAPPDATA%\Programs\CodexConfigTool` 已装有 v1.4.0，**未运行真实安装包**，因此未覆盖用户实际安装；真实 `.codex`、API Key、聊天记录和用户配置均未改动。
+- 结论：GO（本地发布候选）。**安装/升级路径未经端到端验证**（见下），真实环境的任务栏、系统托盘与闪烁结论仍保留为客户实机复测项。
+
 ## 2026-09-01 v1.4.0 发布候选验证（TEST-007）
 
 - 源码语法检查、118 项标准库测试和 `git diff --check` 通过。

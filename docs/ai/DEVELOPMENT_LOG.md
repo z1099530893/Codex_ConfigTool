@@ -1,5 +1,20 @@
 # 开发记录
 
+## DEV-045 - 2026-09-19 - 整理源码树、改为单前端并重建 v1.5.0
+
+阶段和模式：Release / Source hygiene + Packaging validation
+相关 ID：CR-009、BUG-004、BUG-005、TEST-009
+
+工作内容：整理源码树为可提交状态；版本号全线升到 `1.5.0`；把打包链路从「两种前端各出便携版与安装版共四个资产」改为「只出 Qt 版两个资产」。构建产物名与安装后名字拆成 `MyAppSourceExe`（`CodexConfigTool-Qt.exe`）与 `MyAppExeName`（`CodexConfigTool.exe`），由安装器 `[Files]` 的 `DestName` 改名，`[InstallDelete]` 覆盖两个历史 EXE 名。
+
+关键判断：**Tk 发布包移除，但 Tk 代码不能删**。`codex_config_qt.py` 通过 `import codex_config_tool as core` 把该模块当作业务逻辑库使用，删掉它发布的前端就起不来。客户的「只保留最新的」在代码层面只能落成「移除 Tk 发布包」。
+
+验证证据：`git check-ignore -v` 逐项断言忽略与提交清单（110 个文件 / 约 3.4 MB）；`127` 项标准库测试通过；PyInstaller 6.22.2 重建 `dist\CodexConfigTool-Qt.exe`（47 秒），Inno Setup 6.7.1 编译安装包通过；打包启动验证 8/8（`Qt6112QWindowIcon`、`820x500`、无原生边框、0 原生子窗口）；两个资产的字节数、SHA-256 与版本资源（`filever=1.5.0`）逐一核对。`DestName` 的改名语义用一个一次性安装器（独立 `AppId`、`Uninstallable=no`、装到 `{tmp}`）实测确认：`version_info.txt` 确实落成 `ProbeTarget.txt`，且未留下注册表项。
+
+未覆盖项：**没有执行真正的安装步骤**。本机 `%LOCALAPPDATA%\Programs\CodexConfigTool` 已装有 v1.4.0（Tk），跑安装包会覆盖用户的实际安装；因此安装路径的结论来自编译期证据（ISCC 成功压缩 `dist\CodexConfigTool-Qt.exe`）加 `DestName` 实测，不是端到端安装测试。
+
+环境注意：本机执行策略为 `Restricted`，`.ps1` 不能直接运行，`build.bat` 靠 `-ExecutionPolicy Bypass` 绕过；工具层又禁止从 Bash 调用 `cmd.exe`／`powershell.exe`，所以构建是按脚本内容逐条等价执行（PyInstaller → 复制便携版 → ISCC）而非直接跑 `build.bat`。改动构建脚本后应至少手工走一遍这三步。
+
 ## DEV-043 - 2026-09-09 - 固定无标题栏窗口尺寸并重建验证包
 
 阶段和模式：Iterative Development / Development + Packaging validation

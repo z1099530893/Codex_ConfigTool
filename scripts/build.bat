@@ -8,9 +8,9 @@ echo ========================================
 echo   Codex Config Tool - Release Build
 echo ========================================
 echo.
-echo [INFO] Building all four release assets:
-echo [INFO]   Tk  front end: portable + installer
-echo [INFO]   Qt  front end: portable + installer
+echo [INFO] Building the two release assets (Qt front end only):
+echo [INFO]   portable  - no install needed
+echo [INFO]   installer - Start Menu shortcut + uninstaller
 echo.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_installer.ps1"

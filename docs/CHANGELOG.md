@@ -2,13 +2,14 @@
 
 ## 1.5.0
 
-### 新增 Qt 前端
+### 界面换成 Qt 前端（本版起只发布 Qt 版）
 
-- 新增功能与界面完全一致的 Qt（PySide6）前端 `codex_config_qt.py`，复用主程序的全部业务逻辑，只重写视图层
+- 新增 Qt（PySide6）前端 `codex_config_qt.py`，复用主程序的全部业务逻辑，只重写视图层
 - 消除「从任务栏恢复窗口时闪一下」的问题：Tk 顶层窗口没有 backing store，恢复时先呈现后绘制，中间 1-3 帧由合成器用窗口背景色填充；Qt 的顶层窗口同时具备表面与 backing store，实测同样 8 轮最小化/恢复中 **0 帧空白**（Tk 为 8/8 闪、12/241 空白帧）
 - 压平 `Canvas`、`WS_EX_LAYERED`、`WS_EX_COMPOSITED` 三种方案均已实测排除，原因与数据见 `AGENT_HANDOFF_WINDOW_BUGS.md`
-- 两种前端共用同一个安装标识、安装目录和用户设置，可随时换用而不影响已有配置
-- 新增 Qt 版 PyInstaller 配置与构建脚本；两个前端的产物互不覆盖
+- 因为 Tk 的闪烁修不掉，**发布页不再提供 Tk 版**：把有缺陷的版本和修好的版本并排放着，等于给用户一个选中坏版本的机会
+- Tk 视图层保留在 `codex_config_tool.py` 中且**不可删除**：Qt 前端通过 `import codex_config_tool as core` 把它整个当作业务逻辑库使用
+- 新增 Qt 版 PyInstaller 配置与构建脚本；构建产物 `dist\CodexConfigTool-Qt.exe` 与 Tk 回滚产物 `dist\CodexConfigTool.exe` 互不覆盖
 - 新增闪烁与窗口行为的测量工具集 `prototypes/`，可复现全部结论
 
 ### 无边框主窗口（最小化 / 任务栏 / 标题栏）
@@ -39,11 +40,13 @@
 ### 构建与安装
 
 - 修复安装版构建批处理窗口过早关闭的问题；构建完成后显示全部产物的完整输出路径，并保留窗口供用户查看
-- `scripts\build.bat` 现在作为统一入口，一次生成 Tk 与 Qt 的便携版和安装版共四个资产，并输出每个资产的字节数与 SHA-256
-- 三个 PowerShell 构建脚本改为显式验证解释器（同时具备 tkinter、PySide6、PyInstaller），不再信任 PATH 上的第一个 `python`——本机 PATH 上的那个没有 tkinter，构建不会报错，失败会推迟到运行期
+- `scripts\build.bat` 现在作为统一入口，一次生成便携版与安装版两个资产，并输出每个资产的字节数与 SHA-256（同时写入 `build\release-assets.txt`）
+- 构建脚本改为显式验证解释器（同时具备 tkinter、PySide6、PyInstaller），不再信任 PATH 上的第一个 `python`——本机 PATH 上的那个没有 tkinter，构建不会报错，失败会推迟到运行期
 - 修复 Qt 安装包文件名缺少连字符（`CodexConfigToolQt-Setup-…`）
-- 新增 `[InstallDelete]` 段：两个前端共用同一个安装标识和目录，换前端安装时清理另一个前端的 EXE，避免留下孤儿可执行文件
+- 拆分构建产物名与安装后名字：`MyAppSourceExe`（`CodexConfigTool-Qt.exe`）经 `[Files]` 的 `DestName` 落成 `MyAppExeName`（`CodexConfigTool.exe`）。这样 `dist\` 里的 Qt 产物不与 Tk 回滚产物撞名，而安装后的名字仍是 1.4.0 用户熟悉的那一个，快捷方式、`AppMutex`、`UninstallDisplayIcon` 和单实例行为都不用改
+- `[InstallDelete]` 段同时清理 `CodexConfigTool.exe`（1.4.0 及更早的 Tk 版）与 `CodexConfigTool-Qt.exe`（v1.5.0 开发期间可能装过的名字），避免留下不再更新的孤儿可执行文件
 - 修复 `.spec` 通配忽略规则导致 `CodexConfigTool-Qt.spec` 未被纳入版本控制的问题；该文件是 Qt 构建的必需输入，此前从新克隆的仓库无法构建 Qt 前端
+- 单元测试补齐 3 项：发布资产恰好两个且无 Tk 构建路径、`[InstallDelete]` 覆盖两个历史 EXE 名、Qt 前端仍导入共享模块（共 127 项）
 - 版本号全线升到 `1.5.0`：主程序、Windows 版本资源、安装器定义、README 与发布说明
 
 ## 1.4.0

@@ -1,19 +1,17 @@
 # Codex 配置助手
 
-Codex 配置助手 `1.5.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库，界面由 Tkinter 或 PySide6（Qt）提供，使用 PyInstaller 打包。启动时会访问 GitHub Release 检查新版本；只有用户主动点击“获取模型”时，才会将 API Key 发送到用户填写的 Base URL，API Key 不会发送到 GitHub 或其他服务。
+Codex 配置助手 `1.5.0` 是一个 Windows 桌面工具，用于管理和切换多个 Codex 配置。程序使用 Python 标准库，界面由 PySide6（Qt）提供，使用 PyInstaller 打包。启动时会访问 GitHub Release 检查新版本；只有用户主动点击“获取模型”时，才会将 API Key 发送到用户填写的 Base URL，API Key 不会发送到 GitHub 或其他服务。
 
 ## 下载
 
-前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版。同一个版本提供两种前端，功能与界面完全一致，区别只在窗口渲染方式：
+前往 [GitHub Releases](https://github.com/z1099530893/Codex_ConfigTool/releases/latest) 下载最新版。自 1.5.0 起只发布一个前端（Qt），安装版与便携版同时提供：
 
-| 文件 | 前端 | 说明 |
-| --- | --- | --- |
-| `CodexConfigTool-Qt-Setup-v1.5.0.exe` | Qt | **推荐**。修复了从任务栏恢复窗口时的闪烁，约 54 MB |
-| `CodexConfigTool-Qt-Portable-v1.5.0.exe` | Qt | 便携版，无需安装 |
-| `CodexConfigTool-Setup-v1.5.0.exe` | Tk | 体积小（约 13 MB），仍存在恢复时的闪烁 |
-| `CodexConfigTool-Portable-v1.5.0.exe` | Tk | 便携版，无需安装 |
+| 文件 | 说明 |
+| --- | --- |
+| `CodexConfigTool-Setup-v1.5.0.exe` | **推荐**。安装版，约 52 MB，创建开始菜单入口，可正常卸载 |
+| `CodexConfigTool-Portable-v1.5.0.exe` | 便携版，无需安装，约 51 MB |
 
-两种前端共用同一个安装标识和安装目录，安装其中一个会替换另一个，不会并存。
+1.4.0 及更早版本发布的是 Tk 前端。**升级直接安装 1.5.0 即可**：安装器会先删掉旧的 `CodexConfigTool.exe` 再装回同名的 Qt 版，快捷方式、单实例行为和卸载入口都不变，配置与设置也原样保留。
 
 本版变更详见 [发布说明](docs/RELEASE_NOTES_1.5.0.md)，全部已知缺陷及其状态见 [问题台账](docs/ISSUE_LEDGER.md)。
 
@@ -43,7 +41,7 @@ Codex 配置助手 `1.5.0` 是一个 Windows 桌面工具，用于管理和切�
 - 配置与设置采用原子写入，双文件保存失败时自动恢复原内容
 - 配置签名和搜索信息按文件状态缓存，配置变化后自动失效
 - 固定 `820 × 500` 窗口、扁平化界面、深色自定义标题栏和 Windows 任务栏动画
-- 提供 Tk 与 Qt 两种前端，功能与界面完全一致，共用同一份配置和设置，可随时换用
+- 界面基于 Qt（PySide6），从任务栏恢复窗口时不闪烁；源码中另有一份等价的 Tk 视图层，仅供回退与对照测量，自 1.5.0 起不再发布
 
 ## 界面预览
 
@@ -159,9 +157,9 @@ python codex_config_tool.py
 
 本项目运行时只依赖 Python 标准库。
 
-### Qt 前端（可选）
+### Qt 前端
 
-仓库里还有一份功能完全相同、界面完全相同的 Qt 前端：
+发布的产品就是这个前端：
 
 ```powershell
 pip install "PySide6>=6.8,<6.12"
@@ -170,7 +168,9 @@ python codex_config_qt.py
 
 它复用 `codex_config_tool.py` 的全部业务逻辑（配置读写、配置库、进程处理、更新检查等），只重写视图层。注意该模块会导入 `tkinter`，因此所用解释器需要**同时**具备 `PySide6` 和 `tkinter`。
 
-**为什么会有两个前端**：从任务栏恢复窗口时，Tk 前端的主界面会闪一下——顶层窗口先被呈现、内容后绘制，中间 1-3 帧由合成器用窗口自身的背景色填充。Tk 的顶层窗口没有 backing store，把整个视图压到一个 `Canvas` 只能减少约三分之一、无法消除。Qt 的顶层窗口两者兼备，实测同样 8 轮最小化/恢复中 **0 帧空白**。原因、测量方法与数据见 `AGENT_HANDOFF_WINDOW_BUGS.md`，可复现的测量工具在 `prototypes/`。
+**为什么换前端**：从任务栏恢复窗口时，Tk 前端的主界面会闪一下——顶层窗口先被呈现、内容后绘制，中间 1-3 帧由合成器用窗口自身的背景色填充。Tk 的顶层窗口没有 backing store，把整个视图压到一个 `Canvas` 只能减少约三分之一、无法消除。Qt 的顶层窗口两者兼备，实测同样 8 轮最小化/恢复中 **0 帧空白**。原因、测量方法与数据见 `AGENT_HANDOFF_WINDOW_BUGS.md`，可复现的测量工具在 `prototypes/`。
+
+**Tk 前端仍在源码里，但不再发布**（`python codex_config_tool.py` 仍可运行）。原因不是念旧：`codex_config_qt.py` 通过 `import codex_config_tool as core` 把这一整个模块当作业务逻辑库使用，**删掉它，Qt 版就起不来**。所以「只保留最新版」在代码层面表现为「Tk 视图层保留、Tk 发布包移除」。
 
 ### 打包 Qt 前端
 
@@ -178,9 +178,9 @@ python codex_config_qt.py
 scripts\build_qt.bat
 ```
 
-产物是 `dist\CodexConfigTool-Qt.exe`（约 51 MB），**不会覆盖** `dist\CodexConfigTool.exe`。两者并存是刻意的：Tk 版是回滚产物，构建脚本会在结束时核对 Tk 产物的哈希，一旦被改动就报错。
+产物是 `dist\CodexConfigTool-Qt.exe`，**不会覆盖** `dist\CodexConfigTool.exe`。后者自 1.5.0 起不再发布，但仍是 Tk 前端的回滚产物，也是与 Qt 版并排测量时的对照物；构建脚本会在结束时核对它的哈希，一旦被改动就报错。
 
-体积明显大于 Tk 版的 12.6 MB，原因有两条，都不是可以省掉的：需要打包 Qt 运行时；而且 `codex_config_tool.py` 在模块顶层 `import tkinter`，Qt 前端把它整个当作库导入，所以连 tkinter 与 tcl/tk 也一并打包。这是“共用业务逻辑”这个架构的直接代价。
+体积约 51 MB，原因有两条，都不是可以省掉的：需要打包 Qt 运行时；而且 `codex_config_tool.py` 在模块顶层 `import tkinter`，Qt 前端把它整个当作库导入，所以连 tkinter 与 tcl/tk 也一并打包。这是“共用业务逻辑”这个架构的直接代价。
 
 `scripts\build_qt.ps1` 会显式挑选同时具备 PySide6、tkinter、PyInstaller 的解释器，而不是信任 PATH 上的第一个 `python`——本机 PATH 上的那个没有 tkinter，跑不起本项目。
 
@@ -191,7 +191,7 @@ python -m py_compile codex_config_tool.py codex_config_qt.py
 python -m unittest discover -s tests -q
 ```
 
-测试使用临时配置目录，不读取或修改真实用户的 `.codex`。测试覆盖写入故障注入、事务回滚、缓存失效、模型目录、配置切换生命周期、官方登录会话保护和安装包数据边界。当前为 **124 项**，全部通过。
+测试使用临时配置目录，不读取或修改真实用户的 `.codex`。测试覆盖写入故障注入、事务回滚、缓存失效、模型目录、配置切换生命周期、官方登录会话保护和安装包数据边界。当前为 **127 项**，全部通过。
 
 窗口相关的结论**不能只看测试**：本项目为此维护了一套可复现的测量工具（`prototypes/`）和一份完整的调查记录（`AGENT_HANDOFF_WINDOW_BUGS.md`），改动窗口、任务栏或系统托盘代码前请先读它们。
 
@@ -203,34 +203,32 @@ python -m unittest discover -s tests -q
 scripts\build.bat
 ```
 
-该脚本一次生成**四个**发布资产——两种前端各自的便携版与安装版：
+该脚本一次生成**两个**发布资产，都来自 Qt 前端：
 
-| 文件 | 前端 |
+| 文件 | 说明 |
 | --- | --- |
-| `dist\CodexConfigTool-Portable-v<版本>.exe` | Tk |
-| `dist\CodexConfigTool-Setup-v<版本>.exe` | Tk |
-| `dist\CodexConfigTool-Qt-Portable-v<版本>.exe` | Qt |
-| `dist\CodexConfigTool-Qt-Setup-v<版本>.exe` | Qt |
+| `dist\CodexConfigTool-Portable-v<版本>.exe` | 便携版，构建产物 `CodexConfigTool-Qt.exe` 的副本 |
+| `dist\CodexConfigTool-Setup-v<版本>.exe` | 安装版 |
 
-完成或失败时命令行窗口会保留并显示结果，成功时逐个输出字节数与 SHA-256。开发者如需单独调用底层流程：
+完成或失败时命令行窗口会保留并显示结果，成功时逐个输出字节数与 SHA-256，并写入 `build\release-assets.txt`。开发者如需单独调用底层流程：
 
 ```powershell
-.\scripts\build_installer.ps1          # 四个资产
-.\scripts\build.ps1                    # 只出 Tk 便携版
-.\scripts\build_qt.ps1                 # 只出 Qt 便携版
-.\scripts\build_installer.ps1 -SkipBuild -SkipQt   # 只重打 Tk 安装包
+.\scripts\build_installer.ps1                      # 两个发布资产
+.\scripts\build_installer.ps1 -SkipBuild           # 只重打安装包
+.\scripts\build_qt.ps1                             # 只出 Qt 便携版
+.\scripts\build.ps1                                # 只出 Tk 回滚版（不发布）
 ```
 
-`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。安装器定义 `packaging\CodexConfigTool.iss` 通过 ISPP 参数复用：`build_installer.ps1` 调用 ISCC 两次，分别以 `/DMyAppExeName=CodexConfigTool.exe` 和 `/DMyAppExeName=CodexConfigTool-Qt.exe /DMyAppOutputSuffix=-Qt` 传入。两种前端共用同一个 `AppId`、`AppMutex` 和安装目录，它们是同一个应用的两个前端而不是两个应用，因此安装器带一个 `[InstallDelete]` 段，换前端安装时清掉另一个前端的 EXE。
+`version_info.txt` 会写入 Windows 文件版本、产品名称和说明。安装器定义 `packaging\CodexConfigTool.iss` 里构建产物名与安装后名字是**两个**宏：`MyAppSourceExe`（默认 `CodexConfigTool-Qt.exe`）与 `MyAppExeName`（默认 `CodexConfigTool.exe`），`[Files]` 用 `DestName` 把前者落成后者。这样做是为了让 `dist\` 里的 Qt 产物不与 Tk 回滚产物撞名，而安装后的名字仍是 1.4.0 用户熟悉的 `CodexConfigTool.exe`，快捷方式、`AppMutex`、`UninstallDisplayIcon` 和单实例行为都不用改。安装器另带一个 `[InstallDelete]` 段，删掉 `CodexConfigTool.exe` 与 `CodexConfigTool-Qt.exe` 两个名字——前者清掉 1.4.0 装下的 Tk 版，后者清掉 v1.5.0 开发期间可能装过的 Qt 版，避免留下一个不再更新的孤儿可执行文件。
 
 源码仓库只提交源码、文档、测试、构建脚本和图片资源；生成的 EXE 应作为 GitHub Release 附件发布，不提交到源码仓库。
 
 ## 文件结构
 
 ```text
-codex_config_tool.py           主程序（Tk 前端 + 全部业务逻辑）
-codex_config_qt.py             Qt（PySide6）前端，复用上面的业务逻辑
-CodexConfigTool.spec           Tk 版 PyInstaller 配置
+codex_config_tool.py           全部业务逻辑 + Tk 视图层（Qt 版把它当库导入，不可删）
+codex_config_qt.py             Qt（PySide6）视图层，复用上面的业务逻辑（发布的产品）
+CodexConfigTool.spec           Tk 版 PyInstaller 配置（回滚用，不发布）
 CodexConfigTool-Qt.spec        Qt 版 PyInstaller 配置（build_qt.ps1 必需）
 prototypes/                    闪烁问题的测量工具与原型（见其 README）
 tests/                         标准库测试

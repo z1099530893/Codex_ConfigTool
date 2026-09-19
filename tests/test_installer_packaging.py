@@ -22,7 +22,14 @@ class InstallerPackagingTests(unittest.TestCase):
         self.assertIn("Tasks: desktopicon", self.installer)
 
     def test_installer_only_packages_the_application_executable(self) -> None:
-        self.assertIn('Source: "..\\dist\\{#MyAppExeName}"', self.installer)
+        # Source is the build artifact, DestName is the installed name. They differ on
+        # purpose since v1.5.0: dist\ holds CodexConfigTool-Qt.exe (so it cannot clash
+        # with the Tk rollback artifact), while an install lands as
+        # CodexConfigTool.exe, which is the name 1.4.0 already used.
+        self.assertIn('Source: "..\\dist\\{#MyAppSourceExe}"', self.installer)
+        self.assertIn('DestName: "{#MyAppExeName}"', self.installer)
+        self.assertIn('#define MyAppSourceExe "CodexConfigTool-Qt.exe"', self.installer)
+        self.assertIn('#define MyAppExeName "CodexConfigTool.exe"', self.installer)
         self.assertNotIn('Source: "..\\.codex', self.installer)
         self.assertNotIn('Source: "..\\auth.json', self.installer)
         self.assertNotIn('Source: "..\\config.toml', self.installer)
@@ -56,6 +63,34 @@ class InstallerPackagingTests(unittest.TestCase):
         self.assertIn('"CodexConfigTool-Portable-v$appVersion.exe"', self.build_script)
         self.assertIn('"CodexConfigTool-Setup-v$appVersion.exe"', self.build_script)
         self.assertIn('"/DMyAppVersion=$appVersion"', self.build_script)
+
+    def test_release_publishes_exactly_two_assets_from_one_front_end(self) -> None:
+        # v1.5.0 retired the Tk release: its window cannot stop flashing when it is
+        # restored from the taskbar, so shipping it next to the fixed build only gives
+        # users a way to pick the broken one. The Qt names must therefore carry no
+        # suffix, and nothing may still drive a Tk pass.
+        self.assertIn("OutputBaseFilename=CodexConfigTool-Setup-v{#MyAppVersion}", self.installer)
+        self.assertNotIn("MyAppOutputSuffix", self.installer)
+        self.assertNotIn("-Qt-Portable-v", self.build_script)
+        self.assertNotIn("-Qt-Setup-v", self.build_script)
+        # Matched on the invocation, not the bare name: the header comment deliberately
+        # explains that build.ps1 still exists for development and rollback.
+        self.assertNotIn('"build.ps1"', self.build_script)
+
+    def test_installer_removes_every_legacy_executable_name(self) -> None:
+        # Both names can be on disk: CodexConfigTool.exe from a 1.4.0 Tk install, and
+        # CodexConfigTool-Qt.exe from a v1.5.0 development build. Leaving either behind
+        # gives the user an executable that no longer updates.
+        self.assertIn('Type: files; Name: "{app}\\CodexConfigTool.exe"', self.installer)
+        self.assertIn('Type: files; Name: "{app}\\CodexConfigTool-Qt.exe"', self.installer)
+
+    def test_qt_front_end_still_imports_the_shared_module(self) -> None:
+        # codex_config_qt.py imports codex_config_tool as its business-logic library, so
+        # the Tk module cannot be deleted just because the Tk release was retired. This
+        # is the one thing that makes "remove the old version" a partial instruction.
+        qt_front_end = (ROOT / "codex_config_qt.py").read_text(encoding="utf-8")
+        self.assertIn("import codex_config_tool as core", qt_front_end)
+        self.assertTrue((ROOT / "codex_config_tool.py").is_file())
 
 
 if __name__ == "__main__":

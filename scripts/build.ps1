@@ -2,7 +2,15 @@ param(
     [string]$PythonPath = ""
 )
 
-# Build the Tk (shipping) single-file EXE: dist\CodexConfigTool.exe
+# Build the Tk single-file EXE: dist\CodexConfigTool.exe
+#
+# NOT part of the release flow since v1.5.0. The released product is the Qt front
+# end, built by build_qt.ps1, because the Tk window cannot be made to stop flashing
+# when it is restored from the taskbar (no backing store on a Tk top-level - see
+# docs\ISSUE_LEDGER.md). This script is kept for two reasons: it produces the
+# rollback artifact that build_qt.ps1 refuses to overwrite, and it is the way to
+# reproduce the Tk front end for side-by-side measurement with prototypes\*.py.
+# build_installer.ps1 does not call it.
 #
 # Interpreter selection matters here for the same reason it does in build_qt.ps1:
 # this project's module imports tkinter at module level, and the interpreter that

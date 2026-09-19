@@ -1,13 +1,13 @@
 #define MyAppName "Codex 配置助手"
 #define MyAppPublisher "k.x"
+#ifndef MyAppSourceExe
+  #define MyAppSourceExe "CodexConfigTool-Qt.exe"
+#endif
 #ifndef MyAppExeName
   #define MyAppExeName "CodexConfigTool.exe"
 #endif
 #ifndef MyAppVersion
   #define MyAppVersion "1.5.0"
-#endif
-#ifndef MyAppOutputSuffix
-  #define MyAppOutputSuffix ""
 #endif
 
 [Setup]
@@ -24,7 +24,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=CodexConfigTool{#MyAppOutputSuffix}-Setup-v{#MyAppVersion}
+OutputBaseFilename=CodexConfigTool-Setup-v{#MyAppVersion}
 SetupIconFile=..\assets\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
@@ -47,16 +47,20 @@ Name: "chinesesimp"; MessagesFile: "compiler:Default.isl,ChineseSimplifiedOverri
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [InstallDelete]
-; Tk 版与 Qt 版共用同一个 AppId、同一个安装目录、同一个 AppMutex，它们是同一个应用的两个
-; 前端而不是两个应用。所以换前端安装时必须把另一个前端的 EXE 删掉，否则会留下一个孤儿
-; 可执行文件（用户点开它就跑起了另一个前端，而快捷方式指向的是新的那个）。
-; 这一节在 [Files] 之前执行，随后由 [Files] 装回当前前端的 EXE。
-; 用无条件删两个名字而不是按前端分支，是为了不引入 ISPP 条件编译。
+; v1.5.0 起只发布 Qt 前端，安装后的 EXE 统一叫 CodexConfigTool.exe。这里删两个名字，覆盖两种情况：
+;  * CodexConfigTool.exe    —— 1.4.0 及更早装下的 Tk 版，清掉再装新版，避免旧文件被占用时
+;                              留下半新半旧的状态；
+;  * CodexConfigTool-Qt.exe —— v1.5.0 开发期间曾装过的 Qt 版 EXE 名，升级时会残留成孤儿，
+;                              用户点开它就跑起一个不再更新的旧前端。
+; 本节在 [Files] 之前执行，随后由 [Files] 装回当前的 EXE。
 Type: files; Name: "{app}\CodexConfigTool.exe"
 Type: files; Name: "{app}\CodexConfigTool-Qt.exe"
 
 [Files]
-Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; Source 是构建产物名（dist\ 下），DestName 是安装后的名字。两者刻意不同：构建产物带 -Qt
+; 后缀以便与 Tk 版并存于 dist\，而安装后的名字保持 CodexConfigTool.exe，这样 1.4.0 的用户
+; 升级时是原地替换，快捷方式、AppMutex 和单实例行为都不用改。
+Source: "..\dist\{#MyAppSourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
