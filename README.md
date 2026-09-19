@@ -191,7 +191,7 @@ python -m py_compile codex_config_tool.py codex_config_qt.py
 python -m unittest discover -s tests -q
 ```
 
-测试使用临时配置目录，不读取或修改真实用户的 `.codex`。测试覆盖写入故障注入、事务回滚、缓存失效、模型目录、配置切换生命周期、官方登录会话保护和安装包数据边界。当前为 **127 项**，全部通过。
+测试使用临时配置目录，不读取或修改真实用户的 `.codex`。测试覆盖写入故障注入、事务回滚、缓存失效、模型目录、配置切换生命周期、官方登录会话保护、安装包数据边界，以及发布工具本身（`scripts/publish_release.py`）。当前为 **136 项**，全部通过。
 
 窗口相关的结论**不能只看测试**：本项目为此维护了一套可复现的测量工具（`prototypes/`）和一份完整的调查记录（`AGENT_HANDOFF_WINDOW_BUGS.md`），改动窗口、任务栏或系统托盘代码前请先读它们。
 
@@ -223,6 +223,26 @@ scripts\build.bat
 
 源码仓库只提交源码、文档、测试、构建脚本和图片资源；生成的 EXE 应作为 GitHub Release 附件发布，不提交到源码仓库。
 
+### 发布到 GitHub Release
+
+打包完成后，用仓库内的发布工具上传。它把发布拆成**建草稿 → 传附件 → 核对 → 转公开**四步，转公开之前用户看不到，避免出现"页面已上线但附件还在传"的半成品：
+
+```powershell
+python scripts\publish_release.py status     # 只读：要发什么、从哪个提交、文件多大
+python scripts\publish_release.py create     # 建草稿
+python scripts\publish_release.py upload     # 传两个附件
+python scripts\publish_release.py verify     # 只读：把线上发布与本地文件逐项比对
+python scripts\publish_release.py publish    # 转公开（会先自动 verify，不通过就中止）
+```
+
+另有 `body`（只更新发布说明正文）、`latest`、`list` 三个辅助命令。
+
+版本号、标签和附件名都从 `codex_config_tool.py` 的 `APP_VERSION` 推导，仓库名从 `git remote get-url origin` 解析，因此升版本只需改 `APP_VERSION` 一处。**标签必须先推到远端再 `create`**：工具用 `git rev-parse v<版本>^{commit}` 反查提交，标签没推会当场报错，而不是建出一个指向错误代码的发布。
+
+令牌优先读环境变量 `GH_TOKEN` / `GITHUB_TOKEN`，没有则向 git 凭据助手要。注意 Git for Windows 自带的选择器助手（`credential.helper=helper-selector`）**不是**凭据库，而是弹窗让你挑一个，非交互调用会永久挂住，工具会先跳过它；真正的令牌通常在本机安装版 Git（`C:\Program Files\Git`）的 `manager` 助手里。
+
+**顺序要求：先把 `docs\RELEASE_NOTES_<版本>.md` 和 `docs\ai\RELEASE_REPORT.md` 写完，再打标签。** v1.5.0 那次把发布报告写在了打标签之后，从标签导出的源码归档因此缺这一段；修它需要移动已公开的标签（等于强推 tag），与"不改写历史"的约定冲突，只能保留现状并记录在报告里。
+
 ## 文件结构
 
 ```text
@@ -233,7 +253,7 @@ CodexConfigTool-Qt.spec        Qt 版 PyInstaller 配置（build_qt.ps1 必需�
 prototypes/                    闪烁问题的测量工具与原型（见其 README）
 tests/                         标准库测试
 assets/                        图片、图标和赞赏码
-scripts/                       构建脚本和测试补丁脚本
+scripts/                       构建、发布与测试证伪脚本
 packaging/                     Inno Setup 安装包定义
 docs/                          项目说明、交接文档和变更记录
 docs/ISSUE_LEDGER.md           全部已知缺陷及其状态

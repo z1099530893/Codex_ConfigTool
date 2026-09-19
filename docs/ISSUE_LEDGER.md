@@ -193,6 +193,10 @@ Tk 顶层窗口没有 backing store：恢复时窗口先被呈现、内容后绘
 | 发布页同时提供有缺陷的前端 | 把 Tk 版和修好的 Qt 版并排放着，等于给用户一个选中坏版本的机会 | **已修复**：自 1.5.0 起只发布 Qt 版；Tk 视图层保留在源码中（Qt 版依赖它作为业务逻辑库），`build.ps1` 降级为回滚/对照用途 |
 | 版本号升到 1.5.0 后测试失败 | 测试硬编码 `1.4.0`/`1.5.0`，应用升到 1.5.0 后「最新版」不再比当前版本新，更新检查正确地返回 `None` | **已修复**：新增 `newer_release_version()` 从 `app.APP_VERSION` 推导 |
 | PowerShell 脚本乱码/解析失败 | Windows PowerShell 5.1 对没有 UTF-8 BOM 的 `.ps1` 按 ANSI 解码 | **已修复**：三个 `.ps1` 保持纯 ASCII，并用解析器校验而非肉眼阅读 |
+| 发布流程只有一份一次性脚本，且位于被忽略的 `build/` 里 | v1.5.0 是现场写 `build/release_api.py` 发的：版本号、仓库名、标签提交号全写死，靠外部传 `GH_TOKEN` 才能工作，换台机器或换个版本就要重摸一遍；`build/` 被 `.gitignore` 忽略，脚本随时可能丢 | **已修复**：改为仓库内 `scripts/publish_release.py`，四处来源各自唯一（`APP_VERSION` / `git remote get-url origin` / `git rev-parse` / 版本推导的附件名）；原脚本移入 `build/rollback/v150-release-scratch/` 留档 |
+| 发布工具的预检**每次都会失败** | `preflight` 在判断前先执行 `problems.append("")`，使问题列表恒非空，于是 `create`/`upload` 必然以一条不指名任何问题的报错中止 | **已修复**：去掉那条空白条目；新增 `test_preflight_accepts_a_complete_tree` 与「只报真正缺失的文件」两项测试 |
+| 取 GitHub 令牌时挂死 | 按 PATH 顺序试 git，PATH 上那个的 `credential.helper` 是 `helper-selector`——它不是凭据库，是**弹窗让你挑一个**的 GUI，非交互调用会永久等待。`GIT_TERMINAL_PROMPT=0` 管不住它（该变量只压制 git 自己的终端提示，此时在等的是助手） | **已修复**：`resolve_token()` 先读 `git config --get-all credential.helper`，助手名含 `helper-selector` 的候选**在调用之前**跳过。修复前 `status` 挂死 100 秒，修复后 3.8 秒 |
+| 发布页正文与本地发布说明是耦合的 | `verify` 拿线上 `body` 与 `docs/RELEASE_NOTES_<版本>.md` 逐字符比对，改了文件不同步正文会让校验失败、进而让 `publish` 拒绝 | **已知约束，非缺陷**：本轮文档同步刻意不触碰 `docs/RELEASE_NOTES_1.5.0.md`（它描述的是发布当时的 v1.5.0）；需要改正文时用 `publish_release.py body` 显式同步 |
 
 ### 3.5 测量工具自身的问题（测量纪律）
 
@@ -206,6 +210,8 @@ Tk 顶层窗口没有 backing store：恢复时窗口先被呈现、内容后绘
 | **合成输入被宿主机静默拒绝** | `SetCursorPos` 返回 0 且 `GetLastError` 为 0、`SendInput` 返回 1 但光标不动、`GetClipCursor` 是完整虚拟桌面、未锁屏、前台是真实应用；关掉命令沙箱结果完全一样 | **已诊断清楚，不必再推导**。宿主机级别，与沙箱和构建都无关。**判据是光标在重试之间是否移动**：移动 = 有人在用机器 |
 | 同步检查用「自己列过的清单」 | 改成「枚举 `prototypes/` 下所有文件、凡技能目录里同名就比」后才发现 `scripts/tk_visual_tour.py` 是旧快照 | **已修复**：「我同步过的那几个是一致的」是循环论证 |
 | 探针在子进程 `import` 失败时仍打印 `ALL DIALOGS MATCH` | **空表上的绿色结论** | **已修复**，并要求故意证伪后才投入使用 |
+| 校验结果打印出来了，却没进入**最终判定** | 证伪脚本一边打印「`restore verified: False`」，一边在结论里宣布「已回到原始字节」——把校验做成了旁注而不是判据 | **已修复**：还原校验并入退出码与最终结论。**打印出来的校验等于没校验** |
+| 文本编解码往返静默改写行尾 | 脚本用 `read_text`/`write_text` 往返目标文件，在 Windows 上把文件里 505 个 LF 全改成 CRLF（字节数 18742 → 19247），内容对、行尾错，diff 会整篇泛红 | **已修复**：改文件用**字节级**读写。判据：改动前后比对 sha256 与 `\r\n` 计数，别只看内容 |
 
 ---
 

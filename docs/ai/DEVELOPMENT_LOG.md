@@ -1,5 +1,24 @@
 # 开发记录
 
+## DEV-046 - 2026-09-19 - 把发布流程从一次性脚本变成仓库内的工具
+
+阶段和模式：Release / Tooling
+相关 ID：CR-010、TEST-010
+
+工作内容：v1.5.0 的发布是由一个现场写的脚本 `build/release_api.py` 完成的，它躺在被 `.gitignore` 忽略的 `build/` 里，版本号、仓库名和标签提交号全是写死的。新增 `scripts/publish_release.py` 取代它：版本号读 `codex_config_tool.py` 的 `APP_VERSION`，仓库名解析 `git remote get-url origin`，标签提交用 `git rev-parse v{版本}^{commit}` 反查；子命令为 `status | create | upload | verify | body | publish | latest | list`，`create` 遇到已存在的发布直接拒绝，`publish` 先调用 `verify`、不通过即中止。配套新增 `tests/test_publish_release.py`（9 项，测试总数 127 → 136）。原临时脚本移入 `build/rollback/v150-release-scratch/` 存档，不删除。
+
+关键判断一：**取令牌不能按 PATH 顺序试。** 本机 PATH 上的 git 是 `/mingw64/bin/git`，其 `credential.helper` 为 `helper-selector`——那不是凭据库，而是一个弹窗让你**挑一个**凭据库的 GUI。非交互调用它会永久等待，`GIT_TERMINAL_PROMPT=0` **管不住它**（该变量只压制 git 自己的终端提示，此时在等待的是助手而非 git）。真正的令牌在本机安装版 Git（`C:\Program Files\Git`）的 `manager` 助手里。因此 `resolve_token()` 先读 `git config --get-all credential.helper`，助手名含 `helper-selector` 的候选**在调用之前就被跳过**。修复前 `status` 挂死 100 秒超时，修复后 3.8 秒完成。
+
+关键判断二：**发布页正文与本地发布说明是耦合的。** `verify` 会拿线上 `body` 与 `docs/RELEASE_NOTES_<版本>.md` 逐字符比对，因此改了发布说明文件而不重新同步正文，会让 `verify` 报不一致、进而让 `publish` 拒绝。本轮的文档同步刻意**不触碰** `docs/RELEASE_NOTES_1.5.0.md`——它描述的是已发布的 v1.5.0（发布时为 127 项测试），仓库现状由 README 与项目状态描述。
+
+验证证据：新增 9 项测试全部通过，全量 **136 项**通过；四个只读子命令对已发布的 v1.5.0 实跑，`verify` 报告两个附件的 `sha_match=True`，`list` 显示 v1.0.0 至 v1.4.0 的资产数与发布时间未变。**测试经过证伪**：用 `scripts/falsify_publish_release.py` 逐个退回三处修复（`preflight` 的空白条目、`helper-selector` 跳过、`publish` 前置 `verify`），确认三项测试分别变红且落在预期的那一项上，随后字节级还原原文件。证伪脚本纳入版本控制——否则「测试经过证伪」这条声明没有任何人复核得了。
+
+自查发现的自身缺陷（两个，都未发布过）：`preflight` 在判断前先 `problems.append("")`，导致列表恒非空、**每次发布都会以一条不指名任何问题的报错中止**；`resolve_token` 的候选顺序让 `helper-selector` 抢先被执行而挂死。
+
+未覆盖项：没有真的用这套工具再发一次版（`create` / `upload` / `publish` 三条写路径未在真实发布上执行），它们只有 `verify` 与不变量测试覆盖。下一次发版才能验证。
+
+环境注意：证伪脚本最初用 `read_text`/`write_text` 往返读写目标文件，在 Windows 上把文件里 505 个 LF **静默改写成了 CRLF**，而它同时打印着「还原校验 False」却仍宣布还原成功——**校验结果没有进入最终判定**。已改为字节级读写，并把还原校验纳入判定。改动仓库里的文件时，凡经文本编解码往返都会踩这个坑。
+
 ## DEV-045 - 2026-09-19 - 整理源码树、改为单前端并重建 v1.5.0
 
 阶段和模式：Release / Source hygiene + Packaging validation

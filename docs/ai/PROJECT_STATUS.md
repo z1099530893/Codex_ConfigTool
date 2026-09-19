@@ -14,10 +14,11 @@
 - **构建链路改为一次产出两个资产**（便携版 + 安装版，均来自 Qt 前端），并显式验证解释器；构建产物名与安装后名字拆成两个宏，由 `[Files]` 的 `DestName` 改名，使 `dist\` 里的 Qt 产物不与 Tk 回滚产物撞名，而安装后仍是 1.4.0 用户熟悉的 `CodexConfigTool.exe`。
 - **修复 `.spec` 通配忽略规则**：此前 `CodexConfigTool-Qt.spec` 未被纳入版本控制，而 `build_qt.ps1` 依赖它，导致从新克隆的仓库无法构建 Qt 前端。
 - 新增 `docs/ISSUE_LEDGER.md`（全部已知缺陷及其状态）与 `docs/RELEASE_NOTES_1.5.0.md`。
+- **发布流程工具化**：v1.5.0 的发布是靠一个躺在 `build/`（被忽略目录）里的一次性脚本完成的，换台机器就得重新摸一遍。现改为仓库内的 `scripts/publish_release.py`：版本号、标签、附件名从 `APP_VERSION` 推导，仓库名从 `git remote get-url origin` 解析，发布拆成**建草稿 → 传附件 → 核对 → 转公开**四步，`publish` 会先跑 `verify`、不通过就中止。配套 9 项测试，并用一个证伪脚本逐个退回修复、确认测试确实变红。
 
 ## 验证
 
-- Python 3.13.9 语法检查、**127 项标准库测试**、PyInstaller 6.22.2 构建、Inno Setup 6.7.1 编译通过。
+- Python 3.13.9 语法检查、**136 项标准库测试**、PyInstaller 6.22.2 构建、Inno Setup 6.7.1 编译通过。
 - 打包启动验证 **8/8**（窗口类 `Qt6112QWindowIcon`、`820x500`、无原生边框、0 原生子窗口、任务栏样式在位、隔离 APPDATA）、最小化/恢复循环 **55/55**（`verify_packaged_cycles.py`，5 轮）、恢复闪烁复测 **8 轮** `blank 0`、`native_descendants 0`、`sidebar settled 91.0 max 91.0`。**三项都在本次构建的字节上重跑**（闪烁报告 `prototypes/out/flash-qt-exe-v150-rebuilt.json`）。
 - 打包版验收脚本（拖动、两条点击路径、任务栏按钮真实存在）**PASS 5/5**——此前三次均被宿主机的合成输入限制挡在注入之前。
 - `DestName` 的改名语义用一个一次性安装器（独立 `AppId`、`Uninstallable=no`、装到临时目录）实测确认：`version_info.txt` 确实落成 `ProbeTarget.txt`，且未留下注册表项。

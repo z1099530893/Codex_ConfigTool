@@ -1,5 +1,20 @@
 # CR-006 模型目录与配置切换验收报告
 
+## 2026-09-19 发布工具验收（TEST-010）
+
+- 全量标准库测试 **136 项**通过（原 127 项 + 新增 9 项发布工具测试）。新增测试不依赖网络、不依赖本机装有 git、也不依赖 `dist/` 里有产物（该目录被忽略，新克隆的仓库里是空的）。
+- **测试经过证伪**：`scripts/falsify_publish_release.py` 逐个退回三处修复，确认对应测试分别变红、且失败落在预期的那一项上；随后字节级还原，还原后哈希与原始一致、测试重新全绿。该脚本已纳入版本控制，任何人可自行复跑。
+  - `preflight` 的空白列表条目 → `test_preflight_accepts_a_complete_tree` 报错
+  - 取消跳过 `helper-selector` 的 git → `test_token_resolution_never_invokes_a_helper_selector_git` 失败
+  - 取消 `publish` 前置的 `verify` → `test_publish_refuses_when_verification_fails` 报错
+- **只读命令对已发布的 v1.5.0 实跑**（不改动线上任何内容）：
+  - `status`：仓库 `z1099530893/Codex_ConfigTool`、版本 `1.5.0`、标签提交 `762da155f2f9aa686ad4c47c3e5c2a7b0d0f71dd`、两个附件大小与 SHA-256、发布 id `392103053`（`draft=False`）
+  - `verify`：两个附件 `state=uploaded`、`sha_match=True`，`VERIFY OK`
+  - `latest` → `v1.5.0`，2 个附件
+  - `list`：`v1.0.0` 至 `v1.4.0` 的附件数与发布时间与发布时一致，未被触碰
+- **令牌解析修复前后**：修复前 `status` 挂死至 100 秒超时（PATH 上的 git 其助手为 `helper-selector`，非交互调用会弹窗等待）；修复后 3.8 秒完成。
+- 未覆盖项：`create` / `upload` / `publish` 三条写路径未在真实发布上执行。
+
 ## 2026-09-19 v1.5.0 单前端发布验证（TEST-009）
 
 - 源码语法检查（`py_compile codex_config_tool.py codex_config_qt.py`）、**127 项标准库测试**通过。

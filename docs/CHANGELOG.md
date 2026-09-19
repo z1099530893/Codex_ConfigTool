@@ -1,5 +1,17 @@
 # 变更摘要
 
+## 未发布（main 分支）
+
+### 发布流程工具化
+
+- 新增 `scripts/publish_release.py`，取代 v1.5.0 发布时现场写的一次性脚本（后者已移入 `build/rollback/v150-release-scratch/` 留档）
+- 版本号、标签、附件名从 `codex_config_tool.py` 的 `APP_VERSION` 推导，仓库名解析 `git remote get-url origin`，标签提交用 `git rev-parse` 反查——不再有写死的常量
+- 发布拆成**建草稿 → 传附件 → 核对 → 转公开**四段，公开之前用户看不到；`publish` 会先跑 `verify`，线上与本地文件不一致就中止
+- 子命令：`status`、`create`、`upload`、`verify`、`body`、`publish`、`latest`、`list`
+- 取令牌时跳过凭据助手为 `helper-selector` 的 git：那不是凭据库，而是弹窗让用户挑一个，非交互调用会永久挂住（修复前 `status` 挂死 100 秒，修复后 3.8 秒）
+- 新增 `tests/test_publish_release.py` 9 项，测试总数 127 → 136；测试经过逐个退回修复的证伪
+- README 增加「发布到 GitHub Release」一节，含「先写完发布说明与报告再打标签」的顺序要求
+
 ## 1.5.0
 
 ### 界面换成 Qt 前端（本版起只发布 Qt 版）

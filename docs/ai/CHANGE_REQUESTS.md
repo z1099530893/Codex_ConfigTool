@@ -1,5 +1,16 @@
 # 变更请求
 
+## CR-010 - 把发布流程从一次性脚本变成仓库内的工具
+
+提出：2026-09-19
+原始请求：v1.5.0 的发布依赖一个现场写的一次性脚本，它位于被忽略的 `build/` 目录、版本号与仓库名写死，换台机器或换个版本就要重摸一遍。把它变成仓库里可复用的工具，并把这次的流程沉淀下来。
+状态：DONE
+验收标准：发布工具纳入版本控制；版本号、标签、附件名和仓库名都不写死，各自只有一个来源；发布过程对用户不可见地分成草稿与公开两段；转公开之前必须核对线上内容与本地文件一致，不一致则拒绝公开；工具本身有测试覆盖，且测试经过证伪；被取代的临时脚本不删除、留档可查。
+实现与验证：新增 `scripts/publish_release.py`（`status | create | upload | verify | body | publish | latest | list`），版本号读 `APP_VERSION`、仓库名解析 `git remote get-url origin`、标签提交用 `git rev-parse` 反查；`publish` 先调用 `verify`，失败即中止。新增 `tests/test_publish_release.py` 9 项（测试总数 127 → 136），并用 `scripts/falsify_publish_release.py` 逐个退回三处修复、确认对应测试变红后字节级还原。四个只读子命令对已发布的 v1.5.0 实跑：`verify` 报告两个附件 `sha_match=True`，`list` 显示 v1.0.0 至 v1.4.0 未变。原临时脚本移入 `build/rollback/v150-release-scratch/` 并附说明。
+明确排除：不改动 `docs/RELEASE_NOTES_1.5.0.md`。该文件是已发布 release 的正文，`verify` 会拿它与线上 `body` 逐字符比对，改动它会直接导致校验失败；它描述的是发布当时的 v1.5.0（127 项测试），仓库现状由 README 与项目状态描述。不改动任何已发布版本、标签或资产。
+未覆盖项：`create` / `upload` / `publish` 三条写路径没有在真实发布上执行过，只有 `verify` 与不变量测试覆盖；下一次发版才能验证。
+相关记录：CR-009、DEV-046、TEST-010
+
 ## CR-009 - 整理源码、改为单前端并重建 v1.5.0 发布
 
 提出：2026-09-19
